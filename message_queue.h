@@ -1,0 +1,66 @@
+#ifndef MESSAGE_QUEUE_H
+#define MESSAGE_QUEUE_H
+#pragma once
+
+#include <string>
+#include <map>
+#include <list>
+#include <mutex>
+#include <condition_variable>
+#include <algorithm>
+#include <cstring>
+
+class Message {
+public:
+    Message(int id = 0): id(id), size(0) {}
+    int getId() const { return id; }
+    void setPayload(const char* data, size_t len){
+        size = (len < sizeof(payload)) ? len : sizeof(payload);
+        memcpy(payload, data, size);
+    }
+    const char* getPayload() const { return payload; }
+    size_t getSize() const { return size; }
+private:
+    int id;
+    char payload[4096];
+    size_t size;
+};
+
+class MessageQueue {
+public:
+    void enqueue(const Message& msg){
+        std::unique_lock<std::mutex> lock(mtx);
+        queue.push_back(msg);
+        cv.notify_one();
+    }
+    Message dequeue(){
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [this]{ return !queue.empty(); });
+        Message m = queue.front();
+        queue.pop_front();
+        return m;
+    }
+private:
+    std::list<Message> queue;
+    std::mutex mtx;
+    std::condition_variable cv;
+};
+
+class MessageBroker {
+public:
+    void createQueue(const std::string& topic){
+        std::unique_lock<std::mutex> lock(broker_mtx);
+        queues.try_emplace(topic);
+    }
+    MessageQueue& getQueue(const std::string& topic){
+        std::unique_lock<std::mutex> lock(broker_mtx);
+        if (queues.find(topic) == queues.end()) {
+            queues.try_emplace(topic);
+        }
+        return queues[topic];
+    }
+private:
+    std::map<std::string, MessageQueue> queues;
+    std::mutex broker_mtx;
+};
+#endif
