@@ -48,19 +48,21 @@ private:
 
 class MessageBroker {
 public:
-    void createQueue(const std::string& topic){
+    void createQueue(const std::string& key){
         std::unique_lock<std::mutex> lock(broker_mtx);
-        queues.try_emplace(topic);
+        queues.try_emplace(key);
     }
-    MessageQueue& getQueue(const std::string& topic){
+    MessageQueue& getQueue(const std::string& key){
         std::unique_lock<std::mutex> lock(broker_mtx);
-        if (queues.find(topic) == queues.end()) {
-            queues.try_emplace(topic);
+        if (queues.find(key) == queues.end()) {
+            queues.try_emplace(key);
         }
-        return queues[topic];
+        return queues[key];
     }
 private:
     std::map<std::string, MessageQueue> queues;
     std::mutex broker_mtx;
 };
+
+
 #endif
