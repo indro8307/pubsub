@@ -7,7 +7,7 @@
 class ITopic {
 public:
 virtual void publish(const Message& msg) = 0;
-virtual void subscribe(Subscriber& sub) = 0;
+virtual MessageQueue& subscribe(Subscriber& sub) = 0;
 };
 
 /*
@@ -21,15 +21,21 @@ Helpful for task distribution.
       */
 class CompeteConsumerTopic : public ITopic {
 public:
+    CompeteConsumerTopic(MessageBroker& broker, const std::string& topic)
+        : sharedQueue(broker.getQueue(topic)) {}
+
     void publish(const Message& msg) override {
         // Implementation for publishing a message to the topic
+        sharedQueue.enqueue(msg);
     }
-    void subscribe(Subscriber& sub) override {
+
+    MessageQueue& subscribe(Subscriber& sub) override {
         // Implementation for subscribing to the topic
+        return sharedQueue; // All subscribers share the same queue, so we just return the reference to it. The subscriber will keep listening for and dequeue messages from this shared queue.
     }
 private:
     // shared queue
-    MessageBroker broker;
+    MessageQueue& sharedQueue;
     std::string topic;
 };
 
@@ -44,15 +50,25 @@ Topic
  */
 class FanoutTopic: public ITopic {
 public:
+    FanoutTopic(MessageBroker& broker, const std::string& topic)
+        : bro(broker) {}
+
     void publish(const Message& msg) override {
         // Implementation for publishing a message to the topic
+        for(auto& q : subQueues) {
+            q.enqueue(msg);
+        }
     }
-    void subscribe(Subscriber& sub) override {
+    MessageQueue& subscribe(Subscriber& sub) override {
         // Implementation for subscribing to the topic
+        subQueues.push_back(bro.getQueue(sub.getSubName())); // Create a queue for this subscriber
+        return subQueues.back();
     }
 private:
-    // list of subscribers subscribed to this topic
-    std::vector<Subscriber&> subscribers;
+    // list of queues for each subscriber
+    std::vector<MessageQueue&> subQueues;
+    MessageBroker& bro;
+    std::string topic;
 };
 
 #endif

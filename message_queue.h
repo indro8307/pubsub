@@ -59,9 +59,22 @@ public:
         }
         return queues[key];
     }
+    void createTopic(const std::string& topic, ITopic* topicObj) {
+        std::unique_lock<std::mutex> lock(topic_mtx);
+        topics[topic] = topicObj;
+    }   
+    ITopic* getTopic(const std::string& topic) {
+        std::unique_lock<std::mutex> lock(topic_mtx);
+        if (topics.find(topic) == topics.end()) {
+            return nullptr;
+        }
+        return topics[topic];
+    }
 private:
     std::map<std::string, MessageQueue> queues;
+    std::map<std::string, ITopic*> topics;
     std::mutex broker_mtx;
+    std::mutex topic_mtx;
 };
 
 
