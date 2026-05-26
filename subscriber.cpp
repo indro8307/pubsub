@@ -1,22 +1,21 @@
 #include "subscriber.h"
+#include "dispatcher.h"
+#include "message_queue.h"
 #include <iostream>
 #include <stdexcept>
 
-Subscriber::Subscriber(MessageBroker& broker, const std::string& topic)
-    : broker(broker), topic(topic), running(false)
+Subscriber::Subscriber(Dispatcher& dispatcher)
+    : dispatcher(dispatcher), running(false)
 {}
 
-void Subscriber::start(Handler handler){
-    auto* topicPtr = broker.getTopic(topic);
-    if (!topicPtr) {
-        throw std::runtime_error("Topic does not exist: " + topic);
-    }
-    
-    MessageQueue& queue = topicPtr->subscribe(*this);
+void Subscriber::subscribe(const std::string& topic, Handler handler)
+{
+    this->topic = topic;
+    mq = &(dispatcher.subscribe(topic));
     running = true;
-    worker = std::thread([this,handler,&queue](){
+    worker = std::thread([this,handler](){
         while (running) {
-            Message m = queue.dequeue();
+            Message m = mq->dequeue();
             handler(m);
         }
     });
@@ -32,7 +31,8 @@ void Subscriber::stop(){
     // then check while(running), which is now false, and exit gracefully.
     // This is a classic sentinel pattern for graceful thread shutdown in producer-consumer systems.
     Message dummy(-1);
-    broker.getQueue(topic).enqueue(dummy);
+    mq->enqueue(dummy);
+    // dispatcher.unsubscribe(topic); // Assuming this method exists to clean up the subscription
     if (worker.joinable()) worker.join();
 }
 

@@ -5,6 +5,7 @@
 #include <string>
 #include <map>
 #include <list>
+#include <vector>
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
@@ -48,34 +49,63 @@ private:
 
 class MessageBroker {
 public:
-    void createQueue(const std::string& key){
-        std::unique_lock<std::mutex> lock(broker_mtx);
-        queues.try_emplace(key);
-    }
-    MessageQueue& getQueue(const std::string& key){
-        std::unique_lock<std::mutex> lock(broker_mtx);
-        if (queues.find(key) == queues.end()) {
-            queues.try_emplace(key);
+    void fanoutPublish(const std::string& topic, const Message& msg) {
+        std::unique_lock<std::mutex> lock(fo_mtx);
+        auto it = fanoutQueues.find(topic);
+        if (it != fanoutQueues.end()) {
+            for (auto& q : it->second) {
+                q.enqueue(msg);
+            }
         }
-        return queues[key];
-    }
-    void createTopic(const std::string& topic, ITopic* topicObj) {
-        std::unique_lock<std::mutex> lock(topic_mtx);
-        topics[topic] = topicObj;
-    }   
-    ITopic* getTopic(const std::string& topic) {
-        std::unique_lock<std::mutex> lock(topic_mtx);
-        if (topics.find(topic) == topics.end()) {
-            return nullptr;
+        else{
+            // topic not found in fanoutQueues. Create it. Message will be lost since no subscribers yet, but that's acceptable in a pub-sub system.
+            fanoutQueues[topic] = std::vector<MessageQueue>();
         }
-        return topics[topic];
+    }
+
+    MessageQueue& fanoutSubscribe(const std::string& topic) {
+        std::unique_lock<std::mutex> lock(fo_mtx);
+        auto it = fanoutQueues.find(topic);
+        if (it == fanoutQueues.end()) {
+            // topic not found in fanoutQueues. Create it.
+            fanoutQueues[topic] = std::vector<MessageQueue>();
+        }
+        MessageQueue newQueue;
+        fanoutQueues[topic].push_back(newQueue);
+        return fanoutQueues[topic].back();
+    }
+
+    void competePublish(const std::string& topic, const Message& msg) {
+        std::unique_lock<std::mutex> lock(sq_mtx);
+        auto it = sharedQueues.find(topic);
+        if (it != sharedQueues.end()) {
+            it->second.enqueue(msg);
+        }
+        else{
+            // topic not found in sharedQueues. Create a new topic and add insert a message queue.
+            // messge will not be lost since it is enqueued.
+            sharedQueues.emplace(topic, MessageQueue());
+            sharedQueues[topic].enqueue(msg);
+        }
+    }
+
+    MessageQueue& competeSubscribe(const std::string& topic) {
+        std::unique_lock<std::mutex> lock(sq_mtx);
+        auto it = sharedQueues.find(topic);
+        if (it == sharedQueues.end()) {
+            // topic not found in sharedQueues. Create a new topic and add insert a message queue.
+            sharedQueues.emplace(topic, MessageQueue());
+        }
+        return sharedQueues[topic];
     }
 private:
-    std::map<std::string, MessageQueue> queues;
-    std::map<std::string, ITopic*> topics;
-    std::mutex broker_mtx;
-    std::mutex topic_mtx;
+    std::map<std::string, MessageQueue> sharedQueues;
+    std::map<std::string, std::vector<MessageQueue>> fanoutQueues; // for fanout topic
+    //std::map<std::string, ITopic*> topics;
+    std::mutex sq_mtx;
+    std::mutex fo_mtx;
 };
 
+MessageBroker& getGlobalMessageBroker();
 
 #endif

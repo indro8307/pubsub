@@ -3,14 +3,15 @@
 
 #include <string>
 //#include "message_queue.h"
-#include "topic.h"
+#include "dispatcher.h"
 
 class Publisher {
 public:
-	Publisher(MessageBroker& broker, const std::string& topic);
-	void publish(int id, const std::string& payload);
+	Publisher(Dispatcher& dispatcher);;
+	void publish(const std::string& topic, const std::string& payload);
+
 private:
-    ITopic& topic;
+    Dispatcher& dispatcher;
 };
  
 #endif

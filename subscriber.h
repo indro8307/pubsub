@@ -1,8 +1,7 @@
-#ifndef PUBLISHER_H
-#define PUBLISHER_H
+#ifndef SUBSCRIBER_H
+#define SUBSCRIBER_H
 
 #include "message_queue.h"
-#include "topic.h"
 #include <string>
 #include <functional>
 #include <thread>
@@ -11,17 +10,16 @@
 class Subscriber {
 public:
 	using Handler = std::function<void(const Message&)>;
-	Subscriber(MessageBroker& broker, const std::string& topic);
-	void start(Handler handler);
-	void stop();   	
-	std::string getSubName() const { return subName; }
+	Subscriber(Dispatcher& dispatcher);
+	void subscribe(const std::string& topic, Handler handler);
+	void stop();
 	~Subscriber();
 private:
-	MessageBroker& broker;
+	MessageQueue* mq;
+	Dispatcher& dispatcher;
 	std::thread worker;
 	std::atomic<bool> running;
 	std::string topic;
-	std::string subName;
 };
 
 #endif

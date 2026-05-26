@@ -1,13 +1,9 @@
 #include "publisher.h"
 
-Publisher::Publisher(MessageBroker& broker, const std::string& topic)
-	: broker(broker), topic(topic)
-{
-	broker.createQueue(topic);
-}
+Publisher::Publisher(Dispatcher& dispatcher)
+	: dispatcher(dispatcher) {}
 
-void Publisher::publish(int id, const std::string& payload){
-	Message m(id);
-	m.setPayload(payload.c_str(), payload.size());
-	broker.getQueue(topic).enqueue(m);
+void Publisher::publish(const std::string& topic, const std::string& payload){
+{
+	dispatcher.publish(topic, 0, payload); // Using 0 as a placeholder for message ID
 }
