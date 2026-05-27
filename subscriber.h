@@ -2,6 +2,7 @@
 #define SUBSCRIBER_H
 
 #include "message_queue.h"
+#include "dispatcher.h"
 #include <string>
 #include <functional>
 #include <thread>

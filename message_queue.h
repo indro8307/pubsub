@@ -21,6 +21,7 @@ public:
     }
     const char* getPayload() const { return payload; }
     size_t getSize() const { return size; }
+
 private:
     int id;
     char payload[4096];
@@ -59,7 +60,7 @@ public:
         }
         else{
             // topic not found in fanoutQueues. Create it. Message will be lost since no subscribers yet, but that's acceptable in a pub-sub system.
-            fanoutQueues[topic] = std::vector<MessageQueue>();
+            fanoutQueues[topic] = std::list<MessageQueue>();
         }
     }
 
@@ -68,10 +69,9 @@ public:
         auto it = fanoutQueues.find(topic);
         if (it == fanoutQueues.end()) {
             // topic not found in fanoutQueues. Create it.
-            fanoutQueues[topic] = std::vector<MessageQueue>();
+            fanoutQueues[topic] = std::list<MessageQueue>();
         }
-        MessageQueue newQueue;
-        fanoutQueues[topic].push_back(newQueue);
+        fanoutQueues[topic].emplace_back();
         return fanoutQueues[topic].back();
     }
 
@@ -82,9 +82,8 @@ public:
             it->second.enqueue(msg);
         }
         else{
-            // topic not found in sharedQueues. Create a new topic and add insert a message queue.
-            // messge will not be lost since it is enqueued.
-            sharedQueues.emplace(topic, MessageQueue());
+            // topic not found in sharedQueues. Create a new topic and insert a message queue.
+            // Message will not be lost since it is enqueued.
             sharedQueues[topic].enqueue(msg);
         }
     }
@@ -94,13 +93,13 @@ public:
         auto it = sharedQueues.find(topic);
         if (it == sharedQueues.end()) {
             // topic not found in sharedQueues. Create a new topic and add insert a message queue.
-            sharedQueues.emplace(topic, MessageQueue());
+            sharedQueues.try_emplace(topic);
         }
         return sharedQueues[topic];
     }
 private:
     std::map<std::string, MessageQueue> sharedQueues;
-    std::map<std::string, std::vector<MessageQueue>> fanoutQueues; // for fanout topic
+    std::map<std::string, std::list<MessageQueue>> fanoutQueues; // for fanout topic
     //std::map<std::string, ITopic*> topics;
     std::mutex sq_mtx;
     std::mutex fo_mtx;

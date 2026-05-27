@@ -7,7 +7,7 @@
 
 class Publisher {
 public:
-	Publisher(Dispatcher& dispatcher);;
+	Publisher(Dispatcher& dispatcher);
 	void publish(const std::string& topic, const std::string& payload);
 
 private:

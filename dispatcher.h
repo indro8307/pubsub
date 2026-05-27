@@ -2,8 +2,8 @@
 #define DISPATCHER_H
 
 #include "message_queue.h"
-#include "subscriber.h"
-#include "publisher.h"
+//#include "subscriber.h"
+//#include "publisher.h"
 class Dispatcher {
 public:
 virtual void publish(const std::string& topic, int id, const std::string& payload) = 0;
