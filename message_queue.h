@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <algorithm>
 #include <cstring>
+#include <chrono>
 
 class Message {
 public:
@@ -41,6 +42,15 @@ public:
         Message m = queue.front();
         queue.pop_front();
         return m;
+    }
+    bool dequeueFor(Message& out, std::chrono::milliseconds timeout){
+        std::unique_lock<std::mutex> lock(mtx);
+        if (!cv.wait_for(lock, timeout, [this]{ return !queue.empty(); })) {
+            return false;
+        }
+        out = queue.front();
+        queue.pop_front();
+        return true;
     }
 private:
     std::list<Message> queue;
