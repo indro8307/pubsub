@@ -9,8 +9,13 @@ Subscriber::Subscriber(Dispatcher& dispatcher)
     : dispatcher(dispatcher), running(false)
 {}
 
+// subscribe to a topic and register a handler to process the messages
 void Subscriber::subscribe(const std::string& topic, Handler handler)
 {
+    if (worker.joinable()) {
+        throw std::logic_error("Subscriber::subscribe() called while a worker is already active");
+    }
+    std::unique_lock<std::mutex> lock(subscriber_mtx);
     this->topic = topic;
     mq = &(dispatcher.subscribe(topic));
     running = true;
@@ -27,9 +32,13 @@ void Subscriber::subscribe(const std::string& topic, Handler handler)
 }
 
 void Subscriber::stop(){
+    std::unique_lock<std::mutex> lock(subscriber_mtx);
     running.store(false, std::memory_order_release);
     if (worker.joinable()) {
         worker.join();
+        dispatcher.unsubscribe(topic, *mq);
+        mq = nullptr;
+        topic.clear();
     }
 }
 

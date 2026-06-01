@@ -107,10 +107,28 @@ public:
         }
         return sharedQueues[topic];
     }
+
+    void competeUnsubscribe(const std::string& topic, MessageQueue& mq) {
+        // nothing to do here as the message queue is shared between all subscribers.
+    }
+
+    void fanoutUnsubscribe(const std::string& topic, MessageQueue& mq) {
+        std::unique_lock<std::mutex> lock(fo_mtx);
+        auto topicIt = fanoutQueues.find(topic);
+        if (topicIt == fanoutQueues.end()) {
+            return;
+        }
+        auto& queues = topicIt->second;
+        auto qIt = std::find_if(queues.begin(), queues.end(),
+            [&mq](const MessageQueue& q) { return &q == &mq; });
+        if (qIt != queues.end()) {
+            queues.erase(qIt);  // destroys that MessageQueue
+        }
+    }
+
 private:
     std::map<std::string, MessageQueue> sharedQueues;
     std::map<std::string, std::list<MessageQueue>> fanoutQueues; // for fanout topic
-    //std::map<std::string, ITopic*> topics;
     std::mutex sq_mtx;
     std::mutex fo_mtx;
 };
