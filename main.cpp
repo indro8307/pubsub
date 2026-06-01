@@ -1,4 +1,5 @@
 #include <iostream>
+#include <memory>
 #include <thread>
 #include <chrono>
 #include "message_queue.h"
@@ -11,14 +12,14 @@ int main(){
     
     // Competing Consumer Pattern: Multiple subscribers compete for messages on the same topic
     // Only one subscriber receives each message
-    auto& competeDispatcher1 = *(new CompeteConsumerDispatcher());
-    auto& competeDispatcher2 = *(new CompeteConsumerDispatcher());
-    
-    Publisher pub1(competeDispatcher1);
-    Publisher pub2(competeDispatcher2);
+    auto competeDispatcher1 = std::make_unique<CompeteConsumerDispatcher>();
+    auto competeDispatcher2 = std::make_unique<CompeteConsumerDispatcher>();
 
-    Subscriber sub1(competeDispatcher1);
-    Subscriber sub2(competeDispatcher1);
+    Publisher pub1(*competeDispatcher1);
+    Publisher pub2(*competeDispatcher2);
+
+    Subscriber sub1(*competeDispatcher1);
+    Subscriber sub2(*competeDispatcher1);
 
     sub1.subscribe("orders", [](const Message& m){
         if (m.getId() >= 0) {
@@ -62,14 +63,14 @@ int main(){
     std::cout << "\n=== Fan-Out System ===" << std::endl;
     
     // Fan-Out Pattern: All subscribers receive copies of every message on the topic
-    auto& fanoutDispatcher1 = *(new FanoutDispatcher());
-    auto& fanoutDispatcher2 = *(new FanoutDispatcher());
-    
-    Publisher pub3(fanoutDispatcher1);
-    Publisher pub4(fanoutDispatcher2);
+    auto fanoutDispatcher1 = std::make_unique<FanoutDispatcher>();
+    auto fanoutDispatcher2 = std::make_unique<FanoutDispatcher>();
 
-    Subscriber sub3(fanoutDispatcher1);
-    Subscriber sub4(fanoutDispatcher1);
+    Publisher pub3(*fanoutDispatcher1);
+    Publisher pub4(*fanoutDispatcher2);
+
+    Subscriber sub3(*fanoutDispatcher1);
+    Subscriber sub4(*fanoutDispatcher1);
 
     sub3.subscribe("notifications", [](const Message& m){
         if (m.getId() >= 0) {

@@ -20,6 +20,7 @@ private:
 	Dispatcher& dispatcher;
 	std::thread worker;
 	std::atomic<bool> running;
+	std::mutex subscriber_mtx;
 	std::string topic;
 };
 

@@ -8,6 +8,7 @@ class Dispatcher {
 public:
 virtual void publish(const std::string& topic, int id, const std::string& payload) = 0;
 virtual MessageQueue& subscribe(const std::string& topic) = 0;
+virtual void unsubscribe(const std::string& topic, MessageQueue& mq) = 0;
 };
 
 class CompeteConsumerDispatcher : public Dispatcher {
@@ -21,6 +22,9 @@ public:
     }
     MessageQueue& subscribe(const std::string& topic) override {
         return bro.competeSubscribe(topic); // Assuming MessageQueue has a getId() method to return the subscriber ID
+    }
+    void unsubscribe(const std::string& topic, MessageQueue& mq) override {
+        bro.competeUnsubscribe(topic, mq);
     }
 private:
     MessageBroker& bro;
@@ -37,6 +41,9 @@ public:
     }
     MessageQueue& subscribe(const std::string& topic) override {
         return bro.fanoutSubscribe(topic);
+    }
+    void unsubscribe(const std::string& topic, MessageQueue& mq) override {
+        bro.fanoutUnsubscribe(topic, mq);
     }
 private:   
      MessageBroker& bro;
