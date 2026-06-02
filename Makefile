@@ -1,6 +1,6 @@
 # Makefile for pub-sub demo
 CXX = g++
-CXXFLAGS = -std=c++17 -O2
+CXXFLAGS = -std=c++17 -O2 -pthread
 SRC = $(wildcard *.cpp)
 TARGET = pubsub
 LOG = build.log

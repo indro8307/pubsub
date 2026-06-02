@@ -5,10 +5,12 @@
 #include <string>
 #include <map>
 #include <list>
+#include <vector>
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
 #include <cstring>
+#include <chrono>
 
 class Message {
 public:
@@ -20,6 +22,7 @@ public:
     }
     const char* getPayload() const { return payload; }
     size_t getSize() const { return size; }
+
 private:
     int id;
     char payload[4096];
@@ -40,6 +43,15 @@ public:
         queue.pop_front();
         return m;
     }
+    bool dequeueFor(Message& out, std::chrono::milliseconds timeout){
+        std::unique_lock<std::mutex> lock(mtx);
+        if (!cv.wait_for(lock, timeout, [this]{ return !queue.empty(); })) {
+            return false;
+        }
+        out = queue.front();
+        queue.pop_front();
+        return true;
+    }
 private:
     std::list<Message> queue;
     std::mutex mtx;
@@ -48,19 +60,79 @@ private:
 
 class MessageBroker {
 public:
-    void createQueue(const std::string& topic){
-        std::unique_lock<std::mutex> lock(broker_mtx);
-        queues.try_emplace(topic);
-    }
-    MessageQueue& getQueue(const std::string& topic){
-        std::unique_lock<std::mutex> lock(broker_mtx);
-        if (queues.find(topic) == queues.end()) {
-            queues.try_emplace(topic);
+    void fanoutPublish(const std::string& topic, const Message& msg) {
+        std::unique_lock<std::mutex> lock(fo_mtx);
+        auto it = fanoutQueues.find(topic);
+        if (it != fanoutQueues.end()) {
+            for (auto& q : it->second) {
+                q.enqueue(msg);
+            }
         }
-        return queues[topic];
+        else{
+            // topic not found in fanoutQueues. Create it. Message will be lost since no subscribers yet, but that's acceptable in a pub-sub system.
+            fanoutQueues[topic] = std::list<MessageQueue>();
+        }
     }
+
+    MessageQueue& fanoutSubscribe(const std::string& topic) {
+        std::unique_lock<std::mutex> lock(fo_mtx);
+        auto it = fanoutQueues.find(topic);
+        if (it == fanoutQueues.end()) {
+            // topic not found in fanoutQueues. Create it.
+            fanoutQueues[topic] = std::list<MessageQueue>();
+        }
+        fanoutQueues[topic].emplace_back();
+        return fanoutQueues[topic].back();
+    }
+
+    void competePublish(const std::string& topic, const Message& msg) {
+        std::unique_lock<std::mutex> lock(sq_mtx);
+        auto it = sharedQueues.find(topic);
+        if (it != sharedQueues.end()) {
+            it->second.enqueue(msg);
+        }
+        else{
+            // topic not found in sharedQueues. Create a new topic and insert a message queue.
+            // Message will not be lost since it is enqueued.
+            sharedQueues[topic].enqueue(msg);
+        }
+    }
+
+    MessageQueue& competeSubscribe(const std::string& topic) {
+        std::unique_lock<std::mutex> lock(sq_mtx);
+        auto it = sharedQueues.find(topic);
+        if (it == sharedQueues.end()) {
+            // topic not found in sharedQueues. Create a new topic and add insert a message queue.
+            sharedQueues.try_emplace(topic);
+        }
+        return sharedQueues[topic];
+    }
+
+    void competeUnsubscribe(const std::string& topic, MessageQueue& mq) {
+        // nothing to do here as the message queue is shared between all subscribers.
+    }
+
+    void fanoutUnsubscribe(const std::string& topic, MessageQueue& mq) {
+        std::unique_lock<std::mutex> lock(fo_mtx);
+        auto topicIt = fanoutQueues.find(topic);
+        if (topicIt == fanoutQueues.end()) {
+            return;
+        }
+        auto& queues = topicIt->second;
+        auto qIt = std::find_if(queues.begin(), queues.end(),
+            [&mq](const MessageQueue& q) { return &q == &mq; });
+        if (qIt != queues.end()) {
+            queues.erase(qIt);  // destroys that MessageQueue
+        }
+    }
+
 private:
-    std::map<std::string, MessageQueue> queues;
-    std::mutex broker_mtx;
+    std::map<std::string, MessageQueue> sharedQueues;
+    std::map<std::string, std::list<MessageQueue>> fanoutQueues; // for fanout topic
+    std::mutex sq_mtx;
+    std::mutex fo_mtx;
 };
+
+MessageBroker& getGlobalMessageBroker();
+
 #endif

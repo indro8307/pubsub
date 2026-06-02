@@ -1,33 +1,45 @@
 #include "subscriber.h"
+#include "dispatcher.h"
+#include "message_queue.h"
 #include <iostream>
+#include <stdexcept>
+#include <chrono>
 
-Subscriber::Subscriber(MessageBroker& broker, const std::string& topic)
-    : broker(broker), topic(topic), running(false)
+Subscriber::Subscriber(Dispatcher& dispatcher)
+    : dispatcher(dispatcher), running(false)
+{}
+
+// subscribe to a topic and register a handler to process the messages
+void Subscriber::subscribe(const std::string& topic, Handler handler)
 {
-    broker.createQueue(topic);
-}
-
-void Subscriber::start(Handler handler){
+    if (worker.joinable()) {
+        throw std::logic_error("Subscriber::subscribe() called while a worker is already active");
+    }
+    std::unique_lock<std::mutex> lock(subscriber_mtx);
+    this->topic = topic;
+    mq = &(dispatcher.subscribe(topic));
     running = true;
     worker = std::thread([this,handler](){
-        while (running) {
-            Message m = broker.getQueue(topic).dequeue();
+        while (running.load(std::memory_order_acquire)) {
+            Message m;
+            const bool gotMessage = mq->dequeueFor(m, std::chrono::milliseconds(100));
+            if (!gotMessage) {
+                continue;
+            }
             handler(m);
         }
     });
 }
 
 void Subscriber::stop(){
-    running = false;
-    // Enqueue a sentinel (dummy) message to unblock the worker thread.
-    // The worker thread is blocked in dequeue() waiting on cv.wait().
-    // Without this, join() would hang indefinitely because the thread never
-    // wakes up to check the running flag. The dummy message (id=-1) acts as
-    // a signal to wake the thread, allowing it to receive the sentinel and
-    // then check while(running), which is now false, and exit gracefully.
-    Message dummy(-1);
-    broker.getQueue(topic).enqueue(dummy);
-    if (worker.joinable()) worker.join();
+    std::unique_lock<std::mutex> lock(subscriber_mtx);
+    running.store(false, std::memory_order_release);
+    if (worker.joinable()) {
+        worker.join();
+        dispatcher.unsubscribe(topic, *mq);
+        mq = nullptr;
+        topic.clear();
+    }
 }
 
 Subscriber::~Subscriber(){
