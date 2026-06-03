@@ -59,8 +59,7 @@ TEST(CompeteRouting, TwoSubscribers_OneMessage_OnlyOneReceives) {
     pub.publish("orders", "only-one");
 
     std::this_thread::sleep_for(2s); // wait for the message to be processed
-    EXPECT_EQ(sub1Count.load(), 1);
-    EXPECT_EQ(sub2Count.load(), 1);
+    EXPECT_EQ(sub1Count.load() + sub2Count.load(), 1);
 
     s1.stop();
     s2.stop();
