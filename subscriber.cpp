@@ -26,7 +26,11 @@ void Subscriber::subscribe(const std::string& topic, Handler handler)
             if (!gotMessage) {
                 continue;
             }
-            handler(m);
+            try {
+                handler(m);
+            } catch (...) {
+                // Handler errors must not terminate the worker thread.
+            }
         }
     });
 }
