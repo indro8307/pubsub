@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstring>
 #include <chrono>
+#include <atomic>
 
 class Message {
 public:
@@ -58,6 +59,25 @@ private:
     std::condition_variable cv;
 };
 
+struct SubscriptionToken {
+    std::string topic;
+    uint64_t id;
+    MessageQueue* mq;
+    enum class Type {
+        Compete,
+        Fanout
+    };
+    Type type;
+
+    SubscriptionToken()
+        : topic(), id(0), mq(nullptr), type(Type::Compete) {}
+
+    SubscriptionToken(std::string topic, uint64_t id, Type type, MessageQueue* mq)
+        : topic(std::move(topic)), id(id), mq(mq), type(type) {}
+
+    bool valid() const { return mq != nullptr; }
+};
+
 class MessageBroker {
 public:
     void fanoutPublish(const std::string& topic, const Message& msg) {
@@ -74,7 +94,7 @@ public:
         }
     }
 
-    MessageQueue& fanoutSubscribe(const std::string& topic) {
+    SubscriptionToken fanoutSubscribe(const std::string& topic) {
         std::unique_lock<std::mutex> lock(fo_mtx);
         auto it = fanoutQueues.find(topic);
         if (it == fanoutQueues.end()) {
@@ -82,12 +102,16 @@ public:
             fanoutQueues[topic] = std::list<MessageQueue>();
         }
         fanoutQueues[topic].emplace_back();
-        return fanoutQueues[topic].back();
+        auto& mq = fanoutQueues[topic].back();
+        //insert the std::list<MessageQueue>::iterator of the last element into the map
+        const uint64_t id = fanoutSubscriptionId.fetch_add(1);
+        fanoutSubscriptions[id] = std::prev(fanoutQueues[topic].end());
+        return SubscriptionToken(topic, id, SubscriptionToken::Type::Fanout, &mq);
     }
 
     void competePublish(const std::string& topic, const Message& msg) {
         std::unique_lock<std::mutex> lock(sq_mtx);
-        auto it = sharedQueues.find(topic);
+        auto it = sharedQueues.find(topic); 
         if (it != sharedQueues.end()) {
             it->second.enqueue(msg);
         }
@@ -98,32 +122,35 @@ public:
         }
     }
 
-    MessageQueue& competeSubscribe(const std::string& topic) {
+    SubscriptionToken competeSubscribe(const std::string& topic) {
         std::unique_lock<std::mutex> lock(sq_mtx);
         auto it = sharedQueues.find(topic);
         if (it == sharedQueues.end()) {
             // topic not found in sharedQueues. Create a new topic and add insert a message queue.
             sharedQueues.try_emplace(topic);
         }
-        return sharedQueues[topic];
+        auto& mq = sharedQueues[topic];
+        
+        const uint64_t id = competeSubscriptionId.fetch_add(1);
+        return SubscriptionToken(topic, id, SubscriptionToken::Type::Compete, &mq);
     }
 
-    void competeUnsubscribe(const std::string& topic, MessageQueue& mq) {
+    void competeUnsubscribe(const SubscriptionToken& token) {
         // nothing to do here as the message queue is shared between all subscribers.
     }
 
-    void fanoutUnsubscribe(const std::string& topic, MessageQueue& mq) {
+    void fanoutUnsubscribe(const SubscriptionToken& token) {
         std::unique_lock<std::mutex> lock(fo_mtx);
-        auto topicIt = fanoutQueues.find(topic);
+        auto topicIt = fanoutQueues.find(token.topic);
         if (topicIt == fanoutQueues.end()) {
             return;
         }
-        auto& queues = topicIt->second;
-        auto qIt = std::find_if(queues.begin(), queues.end(),
-            [&mq](const MessageQueue& q) { return &q == &mq; });
-        if (qIt != queues.end()) {
-            queues.erase(qIt);  // destroys that MessageQueue
+        auto subIt = fanoutSubscriptions.find(token.id);
+        if (subIt == fanoutSubscriptions.end()) {
+            return;
         }
+        topicIt->second.erase(subIt->second);
+        fanoutSubscriptions.erase(subIt);
     }
 
     // Test / observability: number of fan-out subscriber queues for a topic.
@@ -139,8 +166,11 @@ public:
 private:
     std::map<std::string, MessageQueue> sharedQueues;
     std::map<std::string, std::list<MessageQueue>> fanoutQueues; // for fanout topic
+    std::map<uint64_t, std::list<MessageQueue>::iterator> fanoutSubscriptions;
     std::mutex sq_mtx;
     std::mutex fo_mtx;
+    std::atomic<uint64_t> fanoutSubscriptionId;
+    std::atomic<uint64_t> competeSubscriptionId;
 };
 
 // Optional convenience accessor; prefer injecting MessageBroker& from the composition root.

@@ -6,7 +6,7 @@
 #include <chrono>
 
 Subscriber::Subscriber(Dispatcher& dispatcher)
-    : dispatcher(dispatcher), running(false)
+    : dispatcher(dispatcher), running(false), token_()
 {}
 
 // subscribe to a topic and register a handler to process the messages
@@ -16,10 +16,10 @@ void Subscriber::subscribe(const std::string& topic, Handler handler)
         throw std::logic_error("Subscriber::subscribe() called while a worker is already active");
     }
     std::unique_lock<std::mutex> lock(subscriber_mtx);
-    this->topic = topic;
-    mq = &(dispatcher.subscribe(topic));
+    token_ = dispatcher.subscribe(topic);
     running = true;
-    worker = std::thread([this,handler](){
+    MessageQueue* const mq = token_.mq;
+    worker = std::thread([this, handler, mq]() {
         while (running.load(std::memory_order_acquire)) {
             Message m;
             const bool gotMessage = mq->dequeueFor(m, std::chrono::milliseconds(100));
@@ -40,9 +40,10 @@ void Subscriber::stop(){
     running.store(false, std::memory_order_release);
     if (worker.joinable()) {
         worker.join();
-        dispatcher.unsubscribe(topic, *mq);
-        mq = nullptr;
-        topic.clear();
+        if (token_.valid()) {
+            dispatcher.unsubscribe(token_);
+            token_ = SubscriptionToken{};
+        }
     }
 }
 
