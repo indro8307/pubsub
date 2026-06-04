@@ -82,7 +82,7 @@ CMake links `message_queue.cpp` and `Threads::Threads` (pthread on GCC/Clang).
 
 ## GoogleTest tutorial (quick)
 
-GoogleTest (gtest) is a C++ unit-test framework. Tests live in `tests/pubsub_tests.cpp`.
+GoogleTest (gtest) is a unit-test framework. Tests live in `tests/pubsub_tests.cpp`.
 
 ### Concepts
 
