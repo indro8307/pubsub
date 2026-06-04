@@ -80,6 +80,64 @@ cmake --build .
 
 CMake links `message_queue.cpp` and `Threads::Threads` (pthread on GCC/Clang).
 
+## GoogleTest tutorial (quick)
+
+GoogleTest (gtest) is a unit-test framework. Tests live in `tests/pubsub_tests.cpp`.
+
+### Concepts
+
+| Piece | Meaning |
+|-------|---------|
+| `TEST(SuiteName, TestName)` | One test function; suite groups related tests |
+| `EXPECT_*` | Soft assert — failure is reported, other tests still run |
+| `ASSERT_*` | Hard assert — stops the current test on failure |
+| `EXPECT_THROW(expr, ExceptionType)` | Expects `expr` to throw that exception type |
+| `gtest_main` | Supplies `main()` that runs all tests |
+
+### Minimal example
+
+```cpp
+#include <gtest/gtest.h>
+
+TEST(Math, Adds) {
+    EXPECT_EQ(1 + 1, 2);
+}
+```
+
+### Async pub-sub tests
+
+Workers run in background threads, so tests use:
+
+1. `std::atomic<int>` counters inside handlers  
+2. `waitUntil(lambda, timeout)` — poll until condition or timeout  
+3. `Subscriber::stop()` in test teardown so threads exit cleanly  
+
+Each test creates its own `MessageBroker` (injectable broker) so tests do not share state.
+
+### Build and run tests (CMake)
+
+```bash
+mkdir -p build && cd build
+cmake ..
+cmake --build .
+ctest --output-on-failure
+# or run directly:
+./pubsub_tests
+```
+
+First configure downloads GoogleTest via CMake `FetchContent` (needs network).
+
+### Tests included
+
+| Test | What it checks |
+|------|----------------|
+| `CompeteRouting.TwoSubscribers_OneMessage_OnlyOneReceives` | 1 publish → exactly 1 handler invocation across 2 compete subscribers |
+| `FanoutRouting.TwoSubscribers_BothReceive` | 1 publish → 2 receives with same payload |
+| `SubscriberLifecycle.DoubleSubscribe_Throws` | Second `subscribe()` throws `std::logic_error` |
+| `SubscriberLifecycle.Stop_UnsubscribesFanout` | `fanoutSubscriberCount` drops after each `stop()` |
+| `SubscriberLifecycle.Stop_NoHang` | `stop()` completes within 2 seconds |
+| `SubscriberLifecycle.HandlerThrows_WorkerContinues` | Exception in handler; later message still processed |
+
 ## Project layout
 
 | File | Purpose |
@@ -89,10 +147,11 @@ CMake links `message_queue.cpp` and `Threads::Threads` (pthread on GCC/Clang).
 | `publisher.cpp` | Publish API |
 | `subscriber.cpp` | Subscribe / stop / worker thread |
 | `main.cpp` | End-to-end demo |
+| `tests/pubsub_tests.cpp` | GoogleTest suite |
 
 ## Limitations (MVP)
 
-- Global singleton broker (`getGlobalMessageBroker()`)
+- `MessageBroker` is created in `main` (or tests) and injected into dispatchers; `getGlobalMessageBroker()` remains optional
 - Unbounded queues; no persistence or back-pressure
 - Publisher uses message id `0` for all messages
 - Demo uses fixed `sleep` to drain queues before `stop()`

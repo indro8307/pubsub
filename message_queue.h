@@ -126,6 +126,16 @@ public:
         }
     }
 
+    // Test / observability: number of fan-out subscriber queues for a topic.
+    std::size_t fanoutSubscriberCount(const std::string& topic) {
+        std::unique_lock<std::mutex> lock(fo_mtx);
+        auto it = fanoutQueues.find(topic);
+        if (it == fanoutQueues.end()) {
+            return 0;
+        }
+        return it->second.size();
+    }
+
 private:
     std::map<std::string, MessageQueue> sharedQueues;
     std::map<std::string, std::list<MessageQueue>> fanoutQueues; // for fanout topic
@@ -133,6 +143,7 @@ private:
     std::mutex fo_mtx;
 };
 
+// Optional convenience accessor; prefer injecting MessageBroker& from the composition root.
 MessageBroker& getGlobalMessageBroker();
 
 #endif

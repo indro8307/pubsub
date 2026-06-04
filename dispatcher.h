@@ -13,7 +13,7 @@ virtual void unsubscribe(const std::string& topic, MessageQueue& mq) = 0;
 
 class CompeteConsumerDispatcher : public Dispatcher {
 public:
-    CompeteConsumerDispatcher() : bro(getGlobalMessageBroker()) {} 
+    explicit CompeteConsumerDispatcher(MessageBroker& broker) : bro(broker) {}
 
     void publish(const std::string& topic, int id, const std::string& payload) override {
         Message msg(id);
@@ -21,7 +21,7 @@ public:
         bro.competePublish(topic, msg);
     }
     MessageQueue& subscribe(const std::string& topic) override {
-        return bro.competeSubscribe(topic); // Assuming MessageQueue has a getId() method to return the subscriber ID
+        return bro.competeSubscribe(topic);
     }
     void unsubscribe(const std::string& topic, MessageQueue& mq) override {
         bro.competeUnsubscribe(topic, mq);
@@ -32,7 +32,7 @@ private:
 
 class FanoutDispatcher : public Dispatcher {
 public:
-    FanoutDispatcher() : bro(getGlobalMessageBroker()) {}
+    explicit FanoutDispatcher(MessageBroker& broker) : bro(broker) {}
 
     void publish(const std::string& topic, int id, const std::string& payload) override {
         Message msg(id);

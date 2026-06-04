@@ -12,8 +12,9 @@ int main(){
     
     // Competing Consumer Pattern: Multiple subscribers compete for messages on the same topic
     // Only one subscriber receives each message
-    auto competeDispatcher1 = std::make_unique<CompeteConsumerDispatcher>();
-    auto competeDispatcher2 = std::make_unique<CompeteConsumerDispatcher>();
+    MessageBroker competeBroker;
+    auto competeDispatcher1 = std::make_unique<CompeteConsumerDispatcher>(competeBroker);
+    auto competeDispatcher2 = std::make_unique<CompeteConsumerDispatcher>(competeBroker);
 
     Publisher pub1(*competeDispatcher1);
     Publisher pub2(*competeDispatcher2);
@@ -63,8 +64,9 @@ int main(){
     std::cout << "\n=== Fan-Out System ===" << std::endl;
     
     // Fan-Out Pattern: All subscribers receive copies of every message on the topic
-    auto fanoutDispatcher1 = std::make_unique<FanoutDispatcher>();
-    auto fanoutDispatcher2 = std::make_unique<FanoutDispatcher>();
+    MessageBroker fanoutBroker;
+    auto fanoutDispatcher1 = std::make_unique<FanoutDispatcher>(fanoutBroker);
+    auto fanoutDispatcher2 = std::make_unique<FanoutDispatcher>(fanoutBroker);
 
     Publisher pub3(*fanoutDispatcher1);
     Publisher pub4(*fanoutDispatcher2);
