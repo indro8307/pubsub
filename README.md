@@ -25,25 +25,47 @@ Publisher  →  Dispatcher  →  MessageBroker  →  MessageQueue(s)  →  Subsc
 - `Message` with integer id and fixed-size binary payload (up to 4096 bytes)
 - Thread-safe `MessageQueue`: `enqueue`, blocking `dequeue`, and timed `dequeueFor` (for cooperative shutdown)
 
+### Subscriptions (`SubscriptionToken`)
+
+`subscribe()` returns a `SubscriptionToken` — an opaque handle for unsubscribe, not a raw queue reference.
+
+| Field | Purpose |
+|-------|---------|
+| `topic` | Topic the subscription is bound to |
+| `id` | Monotonic id; fan-out uses this for O(1) lookup |
+| `mq` | Pointer to the subscriber’s `MessageQueue` (worker dequeue only) |
+| `type` | `Compete` or `Fanout` |
+
+`Dispatcher::subscribe(topic)` and `MessageBroker::{compete,fanout}Subscribe(topic)` all return a `SubscriptionToken`. Pass the same token to `unsubscribe()` when tearing down.
+
 ### Competing consumers
 
 - One `MessageQueue` per topic in `sharedQueues`
 - Multiple subscribers on the same topic share that queue; each message is consumed by one worker
-- `competeUnsubscribe` is a no-op (queue remains while the topic exists)
+- `competeSubscribe` returns a `SubscriptionToken`; `competeUnsubscribe(token)` is a no-op (the shared queue remains while the topic exists)
 
 ### Fan-out
 
 - One `MessageQueue` per subscriber, stored in a `std::list` per topic
 - `fanoutPublish` enqueues a copy to every subscriber queue on the topic
-- `fanoutUnsubscribe(topic, mq)` removes that subscriber’s queue from the list (matched by address)
+- `fanoutSubscribe` returns a `SubscriptionToken` and registers the subscriber’s list iterator in an internal `id → iterator` map
+- `fanoutUnsubscribe(token)` removes that subscriber’s queue in O(1) via the token’s `id` (no pointer/address scan)
+
+```cpp
+MessageBroker broker;
+FanoutDispatcher dispatcher(broker);
+
+SubscriptionToken token = dispatcher.subscribe("notifications");
+// ... publish, process messages ...
+dispatcher.unsubscribe(token);  // or let Subscriber::stop() do this
+```
 
 ### Subscriber lifecycle
 
-- `subscribe(topic, handler)` starts a worker thread that polls the queue with `dequeueFor` (100 ms timeout)
-- Graceful shutdown: set `running` false and join the worker (no sentinel messages; safe with shared compete queues)
+- `subscribe(topic, handler)` obtains a `SubscriptionToken`, starts a worker thread, and polls the token’s queue with `dequeueFor` (100 ms timeout)
+- Graceful shutdown: set `running` false, join the worker, then call `dispatcher.unsubscribe(token_)` (fan-out cleanup is automatic via `Subscriber::stop()`)
 - `worker.joinable()` guard prevents a second `subscribe()` while a worker is active
 - `std::mutex` protects `subscribe()` / `stop()` when used from the same subscriber instance
-- `Dispatcher::unsubscribe` is available on the broker/dispatcher API (call after the worker has stopped if you remove fan-out queues)
 
 ### Demo (`main.cpp`)
 
@@ -155,4 +177,4 @@ First configure downloads GoogleTest via CMake `FetchContent` (needs network).
 - Unbounded queues; no persistence or back-pressure
 - Publisher uses message id `0` for all messages
 - Demo uses fixed `sleep` to drain queues before `stop()`
-- Fan-out unsubscribe must be invoked explicitly (e.g. from `Subscriber::stop()`) if you want broker cleanup on shutdown
+- Fan-out broker cleanup requires `fanoutUnsubscribe(token)` (or `Subscriber::stop()`, which calls it automatically)

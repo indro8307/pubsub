@@ -151,6 +151,9 @@ public:
         }
         topicIt->second.erase(subIt->second);
         fanoutSubscriptions.erase(subIt);
+        if (topicIt->second.empty()) {
+            fanoutQueues.erase(topicIt);
+        }
     }
 
     // Test / observability: number of fan-out subscriber queues for a topic.
@@ -161,6 +164,20 @@ public:
             return 0;
         }
         return it->second.size();
+    }
+
+    std::size_t fanoutSubscriptionCount() {
+        std::unique_lock<std::mutex> lock(fo_mtx);
+        return fanoutSubscriptions.size();
+    }
+
+    std::size_t fanoutTotalQueueCount() {
+        std::unique_lock<std::mutex> lock(fo_mtx);
+        std::size_t total = 0;
+        for (const auto& entry : fanoutQueues) {
+            total += entry.second.size();
+        }
+        return total;
     }
 
 private:
