@@ -2,9 +2,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "dispatcher.h"
 #include "message_queue.h"
@@ -188,4 +190,85 @@ TEST(SubscriberLifecycle, HandlerThrows_WorkerContinues) {
     EXPECT_EQ(successfulAfterThrow.load(), 1);
 
     sub.stop();
+}
+
+// --- Fan-out stress: many publishers, many subscribers, full cleanup ---
+
+TEST(FanoutStress, HundredPublishers_ThousandSubscribers_AllReceive) {
+    constexpr int kPublishers = 100;
+    constexpr int kSubscribers = 1000;
+    constexpr int kMessagesPerPublisher = 1;
+    constexpr int kTotalMessages = kPublishers * kMessagesPerPublisher;
+
+    MessageBroker broker;
+    FanoutDispatcher dispatcher(broker);
+    const std::string topic = "stress-fanout";
+
+    auto receivedCounts =
+        std::make_unique<std::atomic<int>[]>(static_cast<std::size_t>(kSubscribers));
+    for (std::size_t i = 0; i < static_cast<std::size_t>(kSubscribers); ++i) {
+        receivedCounts[i].store(0);
+    }
+
+    std::vector<std::unique_ptr<Subscriber>> subscribers;
+    subscribers.reserve(static_cast<std::size_t>(kSubscribers));
+    for (int i = 0; i < kSubscribers; ++i) {
+        subscribers.push_back(std::make_unique<Subscriber>(dispatcher));
+        const int subIdx = i;
+        subscribers.back()->subscribe(topic, [&receivedCounts, subIdx](const Message&) {
+            receivedCounts[static_cast<std::size_t>(subIdx)].fetch_add(
+                1, std::memory_order_relaxed);
+        });
+    }
+
+    std::this_thread::sleep_for(200ms);
+    ASSERT_EQ(broker.fanoutSubscriberCount(topic), static_cast<std::size_t>(kSubscribers));
+    ASSERT_EQ(broker.fanoutSubscriptionCount(), static_cast<std::size_t>(kSubscribers));
+
+    std::vector<std::unique_ptr<Publisher>> publishers;
+    publishers.reserve(static_cast<std::size_t>(kPublishers));
+    for (int i = 0; i < kPublishers; ++i) {
+        publishers.push_back(std::make_unique<Publisher>(dispatcher));
+    }
+
+    std::vector<std::thread> publishThreads;
+    publishThreads.reserve(static_cast<std::size_t>(kPublishers));
+    for (int pubIdx = 0; pubIdx < kPublishers; ++pubIdx) {
+        publishThreads.emplace_back([&publishers, &topic, pubIdx]() {
+            for (int msgIdx = 0; msgIdx < kMessagesPerPublisher; ++msgIdx) {
+                publishers[static_cast<std::size_t>(pubIdx)]->publish(
+                    topic,
+                    "pub" + std::to_string(pubIdx) + "_msg" + std::to_string(msgIdx));
+            }
+        });
+    }
+    for (auto& t : publishThreads) {
+        t.join();
+    }
+
+    ASSERT_TRUE(waitUntil([&]() {
+        for (int i = 0; i < kSubscribers; ++i) {
+            if (receivedCounts[static_cast<std::size_t>(i)].load(
+                    std::memory_order_relaxed) != kTotalMessages) {
+                return false;
+            }
+        }
+        return true;
+    }, 120s));
+
+    for (int i = 0; i < kSubscribers; ++i) {
+        EXPECT_EQ(
+            receivedCounts[static_cast<std::size_t>(i)].load(std::memory_order_relaxed),
+            kTotalMessages)
+            << "subscriber " << i;
+    }
+
+    for (auto& sub : subscribers) {
+        sub->stop();
+    }
+    subscribers.clear();
+
+    EXPECT_EQ(broker.fanoutSubscriberCount(topic), 0u);
+    EXPECT_EQ(broker.fanoutTotalQueueCount(), 0u);
+    EXPECT_EQ(broker.fanoutSubscriptionCount(), 0u);
 }

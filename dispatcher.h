@@ -4,11 +4,12 @@
 #include "message_queue.h"
 //#include "subscriber.h"
 //#include "publisher.h"
+
 class Dispatcher {
 public:
 virtual void publish(const std::string& topic, int id, const std::string& payload) = 0;
-virtual MessageQueue& subscribe(const std::string& topic) = 0;
-virtual void unsubscribe(const std::string& topic, MessageQueue& mq) = 0;
+virtual SubscriptionToken subscribe(const std::string& topic) = 0;
+virtual void unsubscribe(const SubscriptionToken& token) = 0;
 };
 
 class CompeteConsumerDispatcher : public Dispatcher {
@@ -20,11 +21,11 @@ public:
         msg.setPayload(payload.c_str(), payload.size());
         bro.competePublish(topic, msg);
     }
-    MessageQueue& subscribe(const std::string& topic) override {
+    SubscriptionToken subscribe(const std::string& topic) override {
         return bro.competeSubscribe(topic);
     }
-    void unsubscribe(const std::string& topic, MessageQueue& mq) override {
-        bro.competeUnsubscribe(topic, mq);
+    void unsubscribe(const SubscriptionToken& token) override {
+        bro.competeUnsubscribe(token);
     }
 private:
     MessageBroker& bro;
@@ -39,11 +40,11 @@ public:
         msg.setPayload(payload.c_str(), payload.size());
         bro.fanoutPublish(topic, msg);
     }
-    MessageQueue& subscribe(const std::string& topic) override {
+    SubscriptionToken subscribe(const std::string& topic) override {
         return bro.fanoutSubscribe(topic);
     }
-    void unsubscribe(const std::string& topic, MessageQueue& mq) override {
-        bro.fanoutUnsubscribe(topic, mq);
+    void unsubscribe(const SubscriptionToken& token) override {
+        bro.fanoutUnsubscribe(token);
     }
 private:   
      MessageBroker& bro;
