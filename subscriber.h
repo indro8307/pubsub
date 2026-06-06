@@ -9,6 +9,8 @@
 #include <atomic>
 #include <mutex>
 
+enum class SubscriberState { idle, subscribed, stopped };
+
 class Subscriber {
 public:
 	using Handler = std::function<void(const Message&)>;
@@ -20,8 +22,8 @@ private:
 	SubscriptionToken token_;
 	Dispatcher& dispatcher;
 	std::thread worker;
-	std::atomic<bool> running;
 	std::mutex subscriber_mtx;
+	std::atomic<SubscriberState> state;
 };
 
 #endif
