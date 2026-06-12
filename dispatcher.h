@@ -4,27 +4,28 @@
 #include "message_queue.h"
 //#include "subscriber.h"
 //#include "publisher.h"
+
 class Dispatcher {
 public:
 virtual void publish(const std::string& topic, int id, const std::string& payload) = 0;
-virtual MessageQueue& subscribe(const std::string& topic) = 0;
-virtual void unsubscribe(const std::string& topic, MessageQueue& mq) = 0;
+virtual SubscriptionToken subscribe(const std::string& topic) = 0;
+virtual void unsubscribe(const SubscriptionToken& token) = 0;
 };
 
 class CompeteConsumerDispatcher : public Dispatcher {
 public:
-    CompeteConsumerDispatcher() : bro(getGlobalMessageBroker()) {} 
+    explicit CompeteConsumerDispatcher(MessageBroker& broker) : bro(broker) {}
 
     void publish(const std::string& topic, int id, const std::string& payload) override {
         Message msg(id);
         msg.setPayload(payload.c_str(), payload.size());
         bro.competePublish(topic, msg);
     }
-    MessageQueue& subscribe(const std::string& topic) override {
-        return bro.competeSubscribe(topic); // Assuming MessageQueue has a getId() method to return the subscriber ID
+    SubscriptionToken subscribe(const std::string& topic) override {
+        return bro.competeSubscribe(topic);
     }
-    void unsubscribe(const std::string& topic, MessageQueue& mq) override {
-        bro.competeUnsubscribe(topic, mq);
+    void unsubscribe(const SubscriptionToken& token) override {
+        bro.competeUnsubscribe(token);
     }
 private:
     MessageBroker& bro;
@@ -32,18 +33,18 @@ private:
 
 class FanoutDispatcher : public Dispatcher {
 public:
-    FanoutDispatcher() : bro(getGlobalMessageBroker()) {}
+    explicit FanoutDispatcher(MessageBroker& broker) : bro(broker) {}
 
     void publish(const std::string& topic, int id, const std::string& payload) override {
         Message msg(id);
         msg.setPayload(payload.c_str(), payload.size());
         bro.fanoutPublish(topic, msg);
     }
-    MessageQueue& subscribe(const std::string& topic) override {
+    SubscriptionToken subscribe(const std::string& topic) override {
         return bro.fanoutSubscribe(topic);
     }
-    void unsubscribe(const std::string& topic, MessageQueue& mq) override {
-        bro.fanoutUnsubscribe(topic, mq);
+    void unsubscribe(const SubscriptionToken& token) override {
+        bro.fanoutUnsubscribe(token);
     }
 private:   
      MessageBroker& bro;

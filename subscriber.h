@@ -7,6 +7,9 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <mutex>
+
+enum class SubscriberState { idle, subscribed, stopped };
 
 class Subscriber {
 public:
@@ -16,13 +19,11 @@ public:
 	void stop();
 	~Subscriber();
 private:
-	MessageQueue* mq;
+	SubscriptionToken token_;
 	Dispatcher& dispatcher;
 	std::thread worker;
-	std::atomic<bool> running;
 	std::mutex subscriber_mtx;
-	std::string topic;
+	std::atomic<SubscriberState> state;
 };
 
 #endif
-

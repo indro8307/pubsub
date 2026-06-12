@@ -6,40 +6,43 @@
 #include <chrono>
 
 Subscriber::Subscriber(Dispatcher& dispatcher)
-    : dispatcher(dispatcher), running(false)
+    : dispatcher(dispatcher), token_(), state(SubscriberState::idle)
 {}
 
 // subscribe to a topic and register a handler to process the messages
 void Subscriber::subscribe(const std::string& topic, Handler handler)
 {
-    if (worker.joinable()) {
+    if (state.load(std::memory_order_acquire) != SubscriberState::idle) {
         throw std::logic_error("Subscriber::subscribe() called while a worker is already active");
     }
     std::unique_lock<std::mutex> lock(subscriber_mtx);
-    this->topic = topic;
-    mq = &(dispatcher.subscribe(topic));
-    running = true;
-    worker = std::thread([this,handler](){
-        while (running.load(std::memory_order_acquire)) {
+    token_ = dispatcher.subscribe(topic);
+    state.store(SubscriberState::subscribed, std::memory_order_release);
+    MessageQueue* const mq = token_.mq;
+    worker = std::thread([this, handler, mq]() {
+        while (state.load(std::memory_order_acquire) == SubscriberState::subscribed) {
             Message m;
             const bool gotMessage = mq->dequeueFor(m, std::chrono::milliseconds(100));
             if (!gotMessage) {
                 continue;
             }
-            handler(m);
+            try {
+                handler(m);
+            } catch (...) {
+                // Handler errors must not terminate the worker thread.
+            }
         }
     });
 }
 
 void Subscriber::stop(){
     std::unique_lock<std::mutex> lock(subscriber_mtx);
-    running.store(false, std::memory_order_release);
+    state.store(SubscriberState::stopped, std::memory_order_release);
     if (worker.joinable()) {
         worker.join();
-        dispatcher.unsubscribe(topic, *mq);
-        mq = nullptr;
-        topic.clear();
     }
+    dispatcher.unsubscribe(token_);
+    token_ = SubscriptionToken{};
 }
 
 Subscriber::~Subscriber(){
