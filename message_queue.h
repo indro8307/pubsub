@@ -61,20 +61,11 @@ private:
 
 struct SubscriptionToken {
     std::string topic;
+    std::string group;
     uint64_t id;
-    MessageQueue* mq;
-    enum class Type {
-        Compete,
-        Fanout
-    };
-    Type type;
-
-    SubscriptionToken()
-        : topic(), id(0), mq(nullptr), type(Type::Compete) {}
-
-    SubscriptionToken(std::string topic, uint64_t id, Type type, MessageQueue* mq)
-        : topic(std::move(topic)), id(id), mq(mq), type(type) {}
-
+    std::shared_ptr<MessageQueue> mq;
+    SubscriptionToken(std::string topic, std::string group, uint64_t id, std::shared_ptr<MessageQueue> mq)
+        : topic(std::move(topic)), group(std::move(group)), id(id), mq(mq) {}
     bool valid() const { return mq != nullptr; }
 };
 
@@ -109,31 +100,16 @@ public:
         return SubscriptionToken(topic, id, SubscriptionToken::Type::Fanout, &mq);
     }
 
-    void competePublish(const std::string& topic, const Message& msg) {
-        std::unique_lock<std::mutex> lock(sq_mtx);
-        auto it = sharedQueues.find(topic); 
-        if (it != sharedQueues.end()) {
-            it->second.enqueue(msg);
-        }
-        else{
-            // topic not found in sharedQueues. Create a new topic and insert a message queue.
-            // Message will not be lost since it is enqueued.
-            sharedQueues[topic].enqueue(msg);
-        }
+    SubscriptionToken subscribe(const std::string topic, const std::string group)
+    {
+        std::unique_lock<std::mutex> lock(topic_mtx);
+        auto [topic_it, topic_inserted] = topics.try_emplace(topic);
+        auto [group_it, group_inserted] = topic_it->second.groups.try_emplace(group);
+        group_it->second.memberCount++;
+        return SubscriptionToken(topic, group_it->second.memberCount, SubscriptionToken::Type::Compete, group_it->second.queue.get());
     }
-
-    SubscriptionToken competeSubscribe(const std::string& topic) {
-        std::unique_lock<std::mutex> lock(sq_mtx);
-        auto it = sharedQueues.find(topic);
-        if (it == sharedQueues.end()) {
-            // topic not found in sharedQueues. Create a new topic and add insert a message queue.
-            sharedQueues.try_emplace(topic);
-        }
-        auto& mq = sharedQueues[topic];
-        
-        const uint64_t id = competeSubscriptionId.fetch_add(1);
-        return SubscriptionToken(topic, id, SubscriptionToken::Type::Compete, &mq);
-    }
+    void unsubscribe(const SubscriptionToken& token) { topics.erase(token.topic); }
+    void competePublish(const std::string& topic, const Message& msg) { topics[topic].enqueue(msg); }
 
     void competeUnsubscribe(const SubscriptionToken& token) {
         // nothing to do here as the message queue is shared between all subscribers.
@@ -180,9 +156,20 @@ public:
         return total;
     }
 
+
+
 private:
-    std::map<std::string, MessageQueue> sharedQueues;
-    std::map<std::string, std::list<MessageQueue>> fanoutQueues; // for fanout topic
+    struct Group{
+        std::shared_ptr<MessageQueue> queue;
+        std::size_t memberCount = 0
+    };
+    struct Topic{
+        std::map<std::string, Group> groups;
+    };
+    std::map<std::string, Topic> topics;
+    std::mutex topic_mtx;
+    //std::map<std::string, MessageQueue> sharedQueues;
+    //std::map<std::string, std::list<MessageQueue>> fanoutQueues; // for fanout topic
     std::map<uint64_t, std::list<MessageQueue>::iterator> fanoutSubscriptions;
     std::mutex sq_mtx;
     std::mutex fo_mtx;
