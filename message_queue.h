@@ -71,110 +71,113 @@ struct SubscriptionToken {
 
 class MessageBroker {
 public:
-    void fanoutPublish(const std::string& topic, const Message& msg) {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        auto it = fanoutQueues.find(topic);
-        if (it != fanoutQueues.end()) {
-            for (auto& q : it->second) {
-                q.enqueue(msg);
-            }
-        }
-        else{
-            // topic not found in fanoutQueues. Create it. Message will be lost since no subscribers yet, but that's acceptable in a pub-sub system.
-            fanoutQueues[topic] = std::list<MessageQueue>();
-        }
-    }
-
-    SubscriptionToken fanoutSubscribe(const std::string& topic) {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        auto it = fanoutQueues.find(topic);
-        if (it == fanoutQueues.end()) {
-            // topic not found in fanoutQueues. Create it.
-            fanoutQueues[topic] = std::list<MessageQueue>();
-        }
-        fanoutQueues[topic].emplace_back();
-        auto& mq = fanoutQueues[topic].back();
-        //insert the std::list<MessageQueue>::iterator of the last element into the map
-        const uint64_t id = fanoutSubscriptionId.fetch_add(1);
-        fanoutSubscriptions[id] = std::prev(fanoutQueues[topic].end());
-        return SubscriptionToken(topic, id, SubscriptionToken::Type::Fanout, &mq);
-    }
-
     SubscriptionToken subscribe(const std::string topic, const std::string group)
     {
         std::unique_lock<std::mutex> lock(topic_mtx);
         auto [topic_it, topic_inserted] = topics.try_emplace(topic);
         auto [group_it, group_inserted] = topic_it->second.groups.try_emplace(group);
         group_it->second.memberCount++;
-        return SubscriptionToken(topic, group_it->second.memberCount, SubscriptionToken::Type::Compete, group_it->second.queue.get());
+        int64_t subscriptionId = nextSubscriptionId_.fetch_add(1);
+        if (group_it->second.queue == nullptr) {
+            group_it->second.queue = std::make_shared<MessageQueue>();
+        }
+        subscriptions[subscriptionId] = SubscriptionToken(topic, group, subscriptionId, group_it->second.queue);
+        return subscriptions[subscriptionId];
     }
-    void unsubscribe(const SubscriptionToken& token) { topics.erase(token.topic); }
-    void competePublish(const std::string& topic, const Message& msg) { topics[topic].enqueue(msg); }
 
-    void competeUnsubscribe(const SubscriptionToken& token) {
-        // nothing to do here as the message queue is shared between all subscribers.
-    }
-
-    void fanoutUnsubscribe(const SubscriptionToken& token) {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        auto topicIt = fanoutQueues.find(token.topic);
-        if (topicIt == fanoutQueues.end()) {
+    void unsubscribe(const SubscriptionToken& token) 
+    { 
+        std::unique_lock<std::mutex> lock(topic_mtx);
+        auto subscription_it = subscriptions.find(token.id);
+        if (subscription_it == subscriptions.end()) {
             return;
         }
-        auto subIt = fanoutSubscriptions.find(token.id);
-        if (subIt == fanoutSubscriptions.end()) {
+        if(subscription_it->second.topic != token.topic || subscription_it->second.group != token.group) {
             return;
         }
-        topicIt->second.erase(subIt->second);
-        fanoutSubscriptions.erase(subIt);
-        if (topicIt->second.empty()) {
-            fanoutQueues.erase(topicIt);
+        auto topic_it = topics.find(token.topic);
+        if (topic_it == topics.end()) {
+            // clear the subscription
+            subscriptions.erase(subscription_it);
+            return;
+        }   
+        auto group_it = topic_it->second.groups.find(token.group);
+        if (group_it == topic_it->second.groups.end()) {
+            // clear the subscription
+            subscriptions.erase(subscription_it);
+            return;
+        }
+        // decrement the member count
+        group_it->second.memberCount--;
+        // if the member count is 0, delete the message queue and erase the group
+        if (group_it->second.memberCount == 0) {
+            group_it->second.queue.reset();
+            topic_it->second.groups.erase(group_it);
+        }
+        // if the topic has no groups, erase the topic
+        if (topic_it->second.groups.empty()) {
+            topics.erase(topic_it);
+        }
+
+        // erase the subscription
+        subscriptions.erase(subscription_it);
+    }
+
+    bool publish(const std::string topic, const std::string group, const Message& msg, bool buffer = true)
+    {
+        // if buffer is true then create topic , group and message queue and store the message in the queue if they don't exist.
+        // if buffer is false then return false if the topic or group does not exist.
+        std::unique_lock<std::mutex> lock(topic_mtx);
+        if (buffer) {
+            auto [topic_it, topic_inserted] = topics.try_emplace(topic);
+            auto [group_it, group_inserted] = topic_it->second.groups.try_emplace(group);
+            if (group_it->second.queue == nullptr) {
+                group_it->second.queue = std::make_shared<MessageQueue>();
+            }
+            group_it->second.queue->enqueue(msg);
+            return true;
+        }
+        else{
+            auto topic_it = topics.find(topic);
+            if (topic_it == topics.end()) {
+                return false;
+            }
+            auto group_it = topic_it->second.groups.find(group);
+            if (group_it == topic_it->second.groups.end()) {
+                return false;
+            }
+
+            group_it->second.queue->enqueue(msg);
+            return true;
         }
     }
 
-    // Test / observability: number of fan-out subscriber queues for a topic.
-    std::size_t fanoutSubscriberCount(const std::string& topic) {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        auto it = fanoutQueues.find(topic);
-        if (it == fanoutQueues.end()) {
-            return 0;
+    bool publish(const std::string topic, const Message& msg) {
+        // publish to all groups in the topic
+        std::unique_lock<std::mutex> lock(topic_mtx);
+        if (topics.find(topic) == topics.end()) {
+            // topic not found which means no subscribers yet. Message will be lost.
+            return false;
         }
-        return it->second.size();
-    }
-
-    std::size_t fanoutSubscriptionCount() {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        return fanoutSubscriptions.size();
-    }
-
-    std::size_t fanoutTotalQueueCount() {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        std::size_t total = 0;
-        for (const auto& entry : fanoutQueues) {
-            total += entry.second.size();
+        // enqueue the message to all groups in the topic
+        for (auto& group : topics[topic].groups) {
+            group.second.queue->enqueue(msg);
         }
-        return total;
-    }
-
-
+        return true;
+    }    
 
 private:
     struct Group{
         std::shared_ptr<MessageQueue> queue;
-        std::size_t memberCount = 0
+        std::size_t memberCount = 0;
     };
     struct Topic{
         std::map<std::string, Group> groups;
     };
+    std::map<int64_t, SubscriptionToken> subscriptions;
     std::map<std::string, Topic> topics;
     std::mutex topic_mtx;
-    //std::map<std::string, MessageQueue> sharedQueues;
-    //std::map<std::string, std::list<MessageQueue>> fanoutQueues; // for fanout topic
-    std::map<uint64_t, std::list<MessageQueue>::iterator> fanoutSubscriptions;
-    std::mutex sq_mtx;
-    std::mutex fo_mtx;
-    std::atomic<uint64_t> fanoutSubscriptionId;
-    std::atomic<uint64_t> competeSubscriptionId;
+    std::atomic<int64_t> nextSubscriptionId_ = 1;
 };
 
 // Optional convenience accessor; prefer injecting MessageBroker& from the composition root.
