@@ -3,7 +3,6 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -12,62 +11,10 @@
 #include "message_queue.h"
 #include "publisher.h"
 #include "subscriber.h"
-
-namespace {
+#include "test_helpers.h"
 
 using namespace std::chrono_literals;
-
-template <typename Pred>
-bool waitUntil(Pred pred, std::chrono::milliseconds timeout = 3s) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (pred()) {
-            return true;
-        }
-        std::this_thread::sleep_for(10ms);
-    }
-    return pred();
-}
-
-}  // namespace
-
-// --- Compete: one message, two subscribers, exactly one delivery ---
-
-TEST(CompeteRouting, TwoSubscribers_OneMessage_OnlyOneReceives) {
-    MessageBroker broker;
-    CompeteConsumerDispatcher dispatcher(broker);
-    Publisher pub(dispatcher);
-
-    std::atomic<int> sub1Count{0};
-    std::atomic<int> sub2Count{0};
-
-    Subscriber s1(dispatcher);
-    Subscriber s2(dispatcher);
-
-    s1.subscribe("orders", [&](const Message& m) {
-        std::string payload(m.getPayload(), m.getSize());
-        if (payload == "only-one") {
-            ++sub1Count;
-        }
-    });
-    s2.subscribe("orders", [&](const Message& m) {
-        std::string payload(m.getPayload(), m.getSize());
-        if (payload == "only-one") {
-            ++sub2Count;
-        }
-    });
-
-    std::this_thread::sleep_for(50ms);
-    pub.publish("orders", "only-one");
-
-    std::this_thread::sleep_for(2s); // wait for the message to be processed
-    EXPECT_EQ(sub1Count.load() + sub2Count.load(), 1);
-
-    s1.stop();
-    s2.stop();
-}
-
-// --- Fan-out: one message, both subscribers receive same payload ---
+using test_helpers::waitUntil;
 
 TEST(FanoutRouting, TwoSubscribers_BothReceive) {
     MessageBroker broker;
@@ -94,7 +41,7 @@ TEST(FanoutRouting, TwoSubscribers_BothReceive) {
     std::this_thread::sleep_for(50ms);
     pub.publish("notifications", "broadcast");
 
-    std::this_thread::sleep_for(2s); // wait for the message to be processed
+    std::this_thread::sleep_for(2s);
 
     EXPECT_EQ(sub1Count.load(), 1);
     EXPECT_EQ(sub2Count.load(), 1);
@@ -105,23 +52,85 @@ TEST(FanoutRouting, TwoSubscribers_BothReceive) {
     s2.stop();
 }
 
-// --- Subscriber: double subscribe throws ---
-
-TEST(SubscriberLifecycle, DoubleSubscribe_Throws) {
+TEST(FanoutRouting, PublishBeforeSubscribe_MessageLost) {
     MessageBroker broker;
     FanoutDispatcher dispatcher(broker);
+    Publisher pub(dispatcher);
+
+    pub.publish("notifications", "early");
+
+    std::atomic<int> count{0};
     Subscriber sub(dispatcher);
+    sub.subscribe("notifications", [&](const Message&) { ++count; });
 
-    sub.subscribe("t", [](const Message&) {});
-
-    EXPECT_THROW(sub.subscribe("t", [](const Message&) {}), std::logic_error);
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(count.load(), 0);
 
     sub.stop();
 }
 
-// --- Subscriber: stop removes fan-out queue from broker ---
+TEST(FanoutRouting, AfterStop_NoFurtherDelivery) {
+    MessageBroker broker;
+    FanoutDispatcher dispatcher(broker);
+    Publisher pub(dispatcher);
 
-TEST(SubscriberLifecycle, Stop_UnsubscribesFanout) {
+    std::atomic<int> count{0};
+    Subscriber sub(dispatcher);
+    sub.subscribe("notifications", [&](const Message&) { ++count; });
+
+    std::this_thread::sleep_for(50ms);
+    pub.publish("notifications", "first");
+
+    ASSERT_TRUE(waitUntil([&] { return count.load() == 1; }));
+
+    sub.stop();
+    pub.publish("notifications", "after-stop");
+
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(count.load(), 1);
+}
+
+TEST(FanoutRouting, TopicIsolation) {
+    MessageBroker broker;
+    FanoutDispatcher dispatcher(broker);
+    Publisher pub(dispatcher);
+
+    std::atomic<int> topicACount{0};
+    std::atomic<int> topicBCount{0};
+
+    Subscriber subA(dispatcher);
+    Subscriber subB(dispatcher);
+
+    subA.subscribe("topic-a", [&](const Message&) { ++topicACount; });
+    subB.subscribe("topic-b", [&](const Message&) { ++topicBCount; });
+
+    std::this_thread::sleep_for(50ms);
+    pub.publish("topic-a", "for-a");
+
+    ASSERT_TRUE(waitUntil([&] { return topicACount.load() == 1; }));
+
+    EXPECT_EQ(topicACount.load(), 1);
+    EXPECT_EQ(topicBCount.load(), 0);
+
+    subA.stop();
+    subB.stop();
+}
+
+TEST(FanoutRouting, UniqueGroupsPerSubscriber) {
+    MessageBroker broker;
+    FanoutDispatcher dispatcher(broker);
+
+    const SubscriptionToken token1 = dispatcher.subscribe("notifications");
+    const SubscriptionToken token2 = dispatcher.subscribe("notifications");
+
+    EXPECT_NE(token1.group, token2.group);
+    EXPECT_EQ(broker.groupCount("notifications"), 2u);
+
+    dispatcher.unsubscribe(token1);
+    dispatcher.unsubscribe(token2);
+}
+
+TEST(FanoutRouting, Stop_UnsubscribesFanout) {
     MessageBroker broker;
     FanoutDispatcher dispatcher(broker);
     const std::string topic = "cleanup";
@@ -132,67 +141,14 @@ TEST(SubscriberLifecycle, Stop_UnsubscribesFanout) {
     s1.subscribe(topic, [](const Message&) {});
     s2.subscribe(topic, [](const Message&) {});
 
-    ASSERT_EQ(broker.fanoutSubscriberCount(topic), 2u);
+    ASSERT_EQ(broker.groupCount(topic), 2u);
 
     s1.stop();
-    EXPECT_EQ(broker.fanoutSubscriberCount(topic), 1u);
+    EXPECT_EQ(broker.groupCount(topic), 1u);
 
     s2.stop();
-    EXPECT_EQ(broker.fanoutSubscriberCount(topic), 0u);
+    EXPECT_EQ(broker.groupCount(topic), 0u);
 }
-
-// --- Subscriber: stop returns within bounded time ---
-
-TEST(SubscriberLifecycle, Stop_NoHang) {
-    MessageBroker broker;
-    CompeteConsumerDispatcher dispatcher(broker);
-    Subscriber sub(dispatcher);
-
-    sub.subscribe("hang-test", [](const Message&) {
-        std::this_thread::sleep_for(5ms);
-    });
-
-    const auto start = std::chrono::steady_clock::now();
-    sub.stop();
-    const auto elapsed = std::chrono::steady_clock::now() - start;
-
-    EXPECT_LT(elapsed, 2s);
-}
-
-// --- Subscriber: handler exception does not stop processing ---
-
-TEST(SubscriberLifecycle, HandlerThrows_WorkerContinues) {
-    MessageBroker broker;
-    FanoutDispatcher dispatcher(broker);
-    Publisher pub(dispatcher);
-
-    std::atomic<int> handlerCalls{0};
-    std::atomic<int> successfulAfterThrow{0};
-
-    Subscriber sub(dispatcher);
-    sub.subscribe("errors", [&](const Message&) {
-        const int n = ++handlerCalls;
-        if (n == 1) {
-            throw std::runtime_error("simulated handler failure");
-        }
-        ++successfulAfterThrow;
-    });
-
-    std::this_thread::sleep_for(50ms);
-    pub.publish("errors", "first");
-    pub.publish("errors", "second");
-
-    ASSERT_TRUE(waitUntil([&] {
-        return successfulAfterThrow.load() >= 1;
-    }));
-
-    EXPECT_GE(handlerCalls.load(), 2);
-    EXPECT_EQ(successfulAfterThrow.load(), 1);
-
-    sub.stop();
-}
-
-// --- Fan-out stress: many publishers, many subscribers, full cleanup ---
 
 TEST(FanoutStress, HundredPublishers_ThousandSubscribers_AllReceive) {
     constexpr int kPublishers = 100;
@@ -222,8 +178,8 @@ TEST(FanoutStress, HundredPublishers_ThousandSubscribers_AllReceive) {
     }
 
     std::this_thread::sleep_for(200ms);
-    ASSERT_EQ(broker.fanoutSubscriberCount(topic), static_cast<std::size_t>(kSubscribers));
-    ASSERT_EQ(broker.fanoutSubscriptionCount(), static_cast<std::size_t>(kSubscribers));
+    ASSERT_EQ(broker.groupCount(topic), static_cast<std::size_t>(kSubscribers));
+    ASSERT_EQ(broker.subscriptionCount(), static_cast<std::size_t>(kSubscribers));
 
     std::vector<std::unique_ptr<Publisher>> publishers;
     publishers.reserve(static_cast<std::size_t>(kPublishers));
@@ -268,7 +224,7 @@ TEST(FanoutStress, HundredPublishers_ThousandSubscribers_AllReceive) {
     }
     subscribers.clear();
 
-    EXPECT_EQ(broker.fanoutSubscriberCount(topic), 0u);
-    EXPECT_EQ(broker.fanoutTotalQueueCount(), 0u);
-    EXPECT_EQ(broker.fanoutSubscriptionCount(), 0u);
+    EXPECT_EQ(broker.groupCount(topic), 0u);
+    EXPECT_EQ(broker.totalGroupCount(), 0u);
+    EXPECT_EQ(broker.subscriptionCount(), 0u);
 }

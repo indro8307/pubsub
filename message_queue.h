@@ -12,6 +12,7 @@
 #include <cstring>
 #include <chrono>
 #include <atomic>
+#include <stdexcept>
 
 class Message {
 public:
@@ -64,12 +65,25 @@ struct SubscriptionToken {
     std::string group;
     uint64_t id;
     std::shared_ptr<MessageQueue> mq;
+    SubscriptionToken()
+        : topic(""), group(""), id(0), mq(nullptr) {}
     SubscriptionToken(std::string topic, std::string group, uint64_t id, std::shared_ptr<MessageQueue> mq)
         : topic(std::move(topic)), group(std::move(group)), id(id), mq(mq) {}
     bool valid() const { return mq != nullptr; }
 };
 
 class MessageBroker {
+    struct Group {
+        std::shared_ptr<MessageQueue> queue;
+        std::size_t memberCount = 0;
+    };
+    struct Topic {
+        std::map<std::string, Group> groups;
+    };
+    std::map<uint64_t, SubscriptionToken> subscriptions;
+    std::map<std::string, Topic> topics;
+    mutable std::mutex topic_mtx;
+    std::atomic<uint64_t> nextSubscriptionId_ = 1;
 public:
     SubscriptionToken subscribe(const std::string topic, const std::string group)
     {
@@ -77,12 +91,22 @@ public:
         auto [topic_it, topic_inserted] = topics.try_emplace(topic);
         auto [group_it, group_inserted] = topic_it->second.groups.try_emplace(group);
         group_it->second.memberCount++;
-        int64_t subscriptionId = nextSubscriptionId_.fetch_add(1);
+        uint64_t subscriptionId = nextSubscriptionId_.fetch_add(1);
         if (group_it->second.queue == nullptr) {
             group_it->second.queue = std::make_shared<MessageQueue>();
         }
         subscriptions[subscriptionId] = SubscriptionToken(topic, group, subscriptionId, group_it->second.queue);
         return subscriptions[subscriptionId];
+    }
+
+    inline void decrementMemberCount(Group& group)
+    {
+        if (group.memberCount == 0) {
+            // decrement member count has come when it is already 0.
+            // Must be wrong logic. Throw an exception.
+            throw std::logic_error("decrement MemberCount has come when it is already 0.");
+        }
+        group.memberCount--;
     }
 
     void unsubscribe(const SubscriptionToken& token) 
@@ -108,7 +132,7 @@ public:
             return;
         }
         // decrement the member count
-        group_it->second.memberCount--;
+        decrementMemberCount(group_it->second);
         // if the member count is 0, delete the message queue and erase the group
         if (group_it->second.memberCount == 0) {
             group_it->second.queue.reset();
@@ -164,20 +188,32 @@ public:
             group.second.queue->enqueue(msg);
         }
         return true;
-    }    
+    }
 
-private:
-    struct Group{
-        std::shared_ptr<MessageQueue> queue;
-        std::size_t memberCount = 0;
-    };
-    struct Topic{
-        std::map<std::string, Group> groups;
-    };
-    std::map<int64_t, SubscriptionToken> subscriptions;
-    std::map<std::string, Topic> topics;
-    std::mutex topic_mtx;
-    std::atomic<int64_t> nextSubscriptionId_ = 1;
+    // Test / observability: topic-group subscription state.
+    std::size_t groupCount(const std::string& topic) const {
+        std::unique_lock<std::mutex> lock(topic_mtx);
+        auto topic_it = topics.find(topic);
+        if (topic_it == topics.end()) {
+            return 0;
+        }
+        return topic_it->second.groups.size();
+    }
+
+    std::size_t subscriptionCount() const {
+        std::unique_lock<std::mutex> lock(topic_mtx);
+        return subscriptions.size();
+    }
+
+    std::size_t totalGroupCount() const {
+        std::unique_lock<std::mutex> lock(topic_mtx);
+        std::size_t total = 0;
+        for (const auto& entry : topics) {
+            total += entry.second.groups.size();
+        }
+        return total;
+    }
+
 };
 
 // Optional convenience accessor; prefer injecting MessageBroker& from the composition root.

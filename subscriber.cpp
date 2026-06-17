@@ -18,7 +18,7 @@ void Subscriber::subscribe(const std::string& topic, Handler handler)
     std::unique_lock<std::mutex> lock(subscriber_mtx);
     token_ = dispatcher.subscribe(topic);
     state.store(SubscriberState::subscribed, std::memory_order_release);
-    MessageQueue* const mq = token_.mq;
+    MessageQueue* const mq = token_.mq.get();
     worker = std::thread([this, handler, mq]() {
         while (state.load(std::memory_order_acquire) == SubscriberState::subscribed) {
             Message m;
