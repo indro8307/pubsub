@@ -18,7 +18,7 @@ public:
 
     void publish(const std::string& topic, int id, const std::string& payload) override {
         Message msg(id);
-        msg.setPayload(payload.c_str(), payload.size());
+        msg.setPayload(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
         // for compete consumer, generate a group name based on the topic. 
         // We will use the topic name as the group name.
         std::string group = topic;
@@ -44,7 +44,7 @@ public:
 
     void publish(const std::string& topic, int id, const std::string& payload) override {
         Message msg(id);
-        msg.setPayload(payload.c_str(), payload.size());
+        msg.setPayload(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
         // for fanout publish, group is not needed. Message will be broadcast to all subscribers.
         bro.publish(topic, msg);
     }

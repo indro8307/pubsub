@@ -24,14 +24,14 @@ int main(){
 
     sub1.subscribe("orders", [](const Message& m){
         if (m.getId() >= 0) {
-            std::string s(m.getPayload(), m.getSize());
+            std::string s(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
             std::cout << "[Compete] Subscriber1 received payload=" << s << std::endl;
         }
     });
 
     sub2.subscribe("orders", [](const Message& m){
         if (m.getId() >= 0) {
-            std::string s(m.getPayload(), m.getSize());
+            std::string s(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
             std::cout << "[Compete] Subscriber2 received payload=" << s << std::endl;
         }
     });
@@ -76,14 +76,14 @@ int main(){
 
     sub3.subscribe("notifications", [](const Message& m){
         if (m.getId() >= 0) {
-            std::string s(m.getPayload(), m.getSize());
+            std::string s(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
             std::cout << "[FanOut] Subscriber3 received payload=" << s << std::endl;
         }
     });
 
     sub4.subscribe("notifications", [](const Message& m){
         if (m.getId() >= 0) {
-            std::string s(m.getPayload(), m.getSize());
+            std::string s(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
             std::cout << "[FanOut] Subscriber4 received payload=" << s << std::endl;
         }
     });

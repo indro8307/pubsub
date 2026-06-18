@@ -17,35 +17,36 @@
 class Message {
 public:
     Message(int id = 0): id(id), size(0) {}
+    Message(const uint8_t* data, size_t len, int id = 0): id(id), payload(data, data + len), size(len) {}
     int getId() const { return id; }
-    void setPayload(const char* data, size_t len){
-        size = (len < sizeof(payload)) ? len : sizeof(payload);
-        memcpy(payload, data, size);
+    void setPayload(const uint8_t* data, size_t len){
+        payload.assign(data, data + len);
+        size = len;
     }
-    const char* getPayload() const { return payload; }
+    const uint8_t* getPayload() const { return payload.data(); }
     size_t getSize() const { return size; }
 
 private:
     int id;
-    char payload[4096];
+    std::vector<uint8_t> payload;
     size_t size;
 };
 
 class MessageQueue {
 public:
-    void enqueue(const Message& msg){
+    void enqueue(std::shared_ptr<const Message> msg){
         std::unique_lock<std::mutex> lock(mtx);
         queue.push_back(msg);
         cv.notify_one();
     }
-    Message dequeue(){
+    std::shared_ptr<const Message> dequeue(){
         std::unique_lock<std::mutex> lock(mtx);
         cv.wait(lock, [this]{ return !queue.empty(); });
-        Message m = queue.front();
+        std::shared_ptr<const Message> m = queue.front();
         queue.pop_front();
         return m;
     }
-    bool dequeueFor(Message& out, std::chrono::milliseconds timeout){
+    bool dequeueFor(std::shared_ptr<const Message>& out, std::chrono::milliseconds timeout){
         std::unique_lock<std::mutex> lock(mtx);
         if (!cv.wait_for(lock, timeout, [this]{ return !queue.empty(); })) {
             return false;
@@ -55,7 +56,7 @@ public:
         return true;
     }
 private:
-    std::list<Message> queue;
+    std::list<std::shared_ptr<const Message>> queue;
     std::mutex mtx;
     std::condition_variable cv;
 };
@@ -158,7 +159,7 @@ public:
             if (group_it->second.queue == nullptr) {
                 group_it->second.queue = std::make_shared<MessageQueue>();
             }
-            group_it->second.queue->enqueue(msg);
+            group_it->second.queue->enqueue(std::make_shared<const Message>(std::move(msg)));
             return true;
         }
         else{
@@ -171,7 +172,7 @@ public:
                 return false;
             }
 
-            group_it->second.queue->enqueue(msg);
+            group_it->second.queue->enqueue(std::make_shared<const Message>(std::move(msg)));
             return true;
         }
     }
@@ -185,7 +186,7 @@ public:
         }
         // enqueue the message to all groups in the topic
         for (auto& group : topics[topic].groups) {
-            group.second.queue->enqueue(msg);
+            group.second.queue->enqueue(std::make_shared<const Message>(std::move(msg)));
         }
         return true;
     }

@@ -28,13 +28,13 @@ TEST(CompeteRouting, TwoSubscribers_OneMessage_OnlyOneReceives) {
     Subscriber s2(dispatcher);
 
     s1.subscribe("orders", [&](const Message& m) {
-        std::string payload(m.getPayload(), m.getSize());
+        std::string payload(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
         if (payload == "only-one") {
             ++sub1Count;
         }
     });
     s2.subscribe("orders", [&](const Message& m) {
-        std::string payload(m.getPayload(), m.getSize());
+        std::string payload(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
         if (payload == "only-one") {
             ++sub2Count;
         }

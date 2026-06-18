@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <memory>
 #include <string>
 
 #include "message_queue.h"
@@ -89,7 +90,7 @@ TEST(MessageBrokerTest, Unsubscribe_InvalidToken_NoOp) {
 TEST(MessageBrokerTest, PublishToGroup_BufferFalse_MissingTopic_ReturnsFalse) {
     MessageBroker broker;
     Message msg(1);
-    msg.setPayload("x", 1);
+    msg.setPayload(reinterpret_cast<const uint8_t*>("x"), 1);
 
     EXPECT_FALSE(broker.publish("missing-topic", "missing-group", msg, false));
 }
@@ -101,14 +102,14 @@ TEST(MessageBrokerTest, PublishToGroup_BufferFalse_MissingGroup_ReturnsFalse) {
     broker.subscribe(topic, group);
 
     Message msg(1);
-    msg.setPayload("x", 1);
+    msg.setPayload(reinterpret_cast<const uint8_t*>("x"), 1);
     EXPECT_FALSE(broker.publish(topic, "other-group", msg, false));
 }
 
 TEST(MessageBrokerTest, PublishToTopic_NoSubscribers_ReturnsFalse) {
     MessageBroker broker;
     Message msg(1);
-    msg.setPayload("x", 1);
+    msg.setPayload(reinterpret_cast<const uint8_t*>("x"), 1);
 
     EXPECT_FALSE(broker.publish("missing-topic", msg));
 }
@@ -123,18 +124,18 @@ TEST(MessageBrokerTest, PublishToTopic_BroadcastsToAllGroups) {
     ASSERT_TRUE(sub2.valid());
 
     Message msg(42);
-    msg.setPayload("hello", 5);
+    msg.setPayload(reinterpret_cast<const uint8_t*>("hello"), 5);
     ASSERT_TRUE(broker.publish(topic, msg));
 
-    Message received1;
-    Message received2;
+    std::shared_ptr<const Message> received1;
+    std::shared_ptr<const Message> received2;
     ASSERT_TRUE(sub1.mq->dequeueFor(received1, 500ms));
     ASSERT_TRUE(sub2.mq->dequeueFor(received2, 500ms));
 
-    EXPECT_EQ(received1.getId(), 42);
-    EXPECT_EQ(received2.getId(), 42);
-    EXPECT_EQ(std::string(received1.getPayload(), received1.getSize()), "hello");
-    EXPECT_EQ(std::string(received2.getPayload(), received2.getSize()), "hello");
+    EXPECT_EQ(received1->getId(), 42);
+    EXPECT_EQ(received2->getId(), 42);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(received1->getPayload()), received1->getSize()), "hello");
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(received2->getPayload()), received2->getSize()), "hello");
 
     broker.unsubscribe(sub1);
     broker.unsubscribe(sub2);

@@ -31,11 +31,11 @@ TEST(FanoutRouting, TwoSubscribers_BothReceive) {
 
     s1.subscribe("notifications", [&](const Message& m) {
         ++sub1Count;
-        sub1Payload = std::string(m.getPayload(), m.getSize());
+        sub1Payload = std::string(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
     });
     s2.subscribe("notifications", [&](const Message& m) {
         ++sub2Count;
-        sub2Payload = std::string(m.getPayload(), m.getSize());
+        sub2Payload = std::string(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
     });
 
     std::this_thread::sleep_for(50ms);

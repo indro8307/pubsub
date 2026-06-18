@@ -21,13 +21,13 @@ void Subscriber::subscribe(const std::string& topic, Handler handler)
     MessageQueue* const mq = token_.mq.get();
     worker = std::thread([this, handler, mq]() {
         while (state.load(std::memory_order_acquire) == SubscriberState::subscribed) {
-            Message m;
+            std::shared_ptr<const Message> m;
             const bool gotMessage = mq->dequeueFor(m, std::chrono::milliseconds(100));
             if (!gotMessage) {
                 continue;
             }
             try {
-                handler(m);
+                handler(*m);
             } catch (...) {
                 // Handler errors must not terminate the worker thread.
             }
