@@ -52,6 +52,61 @@ TEST(FanoutRouting, TwoSubscribers_BothReceive) {
     s2.stop();
 }
 
+TEST(FanoutRouting, TenSubscribers_LargePayload_AllReceive) {
+    constexpr std::size_t kPayloadSize = 5 * 1024;
+    constexpr int kSubscribers = 10;
+
+    std::string payload(kPayloadSize, '\0');
+    for (std::size_t i = 0; i < kPayloadSize; ++i) {
+        payload[i] = static_cast<char>(i % 256);
+    }
+
+    MessageBroker broker;
+    FanoutDispatcher dispatcher(broker);
+    Publisher pub(dispatcher);
+    const std::string topic = "large-payload";
+
+    auto receivedCounts =
+        std::make_unique<std::atomic<int>[]>(static_cast<std::size_t>(kSubscribers));
+    std::vector<std::string> receivedPayloads(static_cast<std::size_t>(kSubscribers));
+
+    std::vector<std::unique_ptr<Subscriber>> subscribers;
+    subscribers.reserve(static_cast<std::size_t>(kSubscribers));
+    for (int i = 0; i < kSubscribers; ++i) {
+        receivedCounts[static_cast<std::size_t>(i)].store(0);
+        subscribers.push_back(std::make_unique<Subscriber>(dispatcher));
+        const int subIdx = i;
+        subscribers.back()->subscribe(topic, [&, subIdx](const Message& m) {
+            receivedCounts[static_cast<std::size_t>(subIdx)].fetch_add(1);
+            receivedPayloads[static_cast<std::size_t>(subIdx)] =
+                std::string(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
+        });
+    }
+
+    std::this_thread::sleep_for(50ms);
+    pub.publish(topic, payload);
+
+    ASSERT_TRUE(waitUntil([&]() {
+        for (int i = 0; i < kSubscribers; ++i) {
+            if (receivedCounts[static_cast<std::size_t>(i)].load() != 1) {
+                return false;
+            }
+        }
+        return true;
+    }));
+
+    for (int i = 0; i < kSubscribers; ++i) {
+        EXPECT_EQ(receivedCounts[static_cast<std::size_t>(i)].load(), 1) << "subscriber " << i;
+        EXPECT_EQ(receivedPayloads[static_cast<std::size_t>(i)].size(), kPayloadSize)
+            << "subscriber " << i;
+        EXPECT_EQ(receivedPayloads[static_cast<std::size_t>(i)], payload) << "subscriber " << i;
+    }
+
+    for (auto& sub : subscribers) {
+        sub->stop();
+    }
+}
+
 TEST(FanoutRouting, PublishBeforeSubscribe_MessageLost) {
     MessageBroker broker;
     FanoutDispatcher dispatcher(broker);
