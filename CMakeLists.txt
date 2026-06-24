@@ -9,6 +9,7 @@ set(PUBSUB_SOURCES
     publisher.cpp
     subscriber.cpp
     message_queue.cpp
+    message_broker.cpp
 )
 
 add_executable(pubsub main.cpp ${PUBSUB_SOURCES})

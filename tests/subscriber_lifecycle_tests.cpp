@@ -8,7 +8,7 @@
 #include <thread>
 
 #include "dispatcher.h"
-#include "message_queue.h"
+#include "message_broker.h"
 #include "publisher.h"
 #include "subscriber.h"
 #include "test_helpers.h"

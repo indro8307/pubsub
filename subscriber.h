@@ -1,7 +1,7 @@
 #ifndef SUBSCRIBER_H
 #define SUBSCRIBER_H
 
-#include "message_queue.h"
+#include "message_broker.h"
 #include "dispatcher.h"
 #include <string>
 #include <functional>

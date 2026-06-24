@@ -4,7 +4,7 @@
 #include <memory>
 #include <string>
 
-#include "message_queue.h"
+#include "message_broker.h"
 #include "test_helpers.h"
 
 using namespace std::chrono_literals;

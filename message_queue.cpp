@@ -86,9 +86,3 @@ bool RejectNewBackPressureStrategy::try_dequeueFor(MessageQueue& mq, std::shared
     mq.queue.pop_front();
     return true;
 }
-
-// Legacy singleton for quick demos; main and tests should own a MessageBroker and inject it.
-MessageBroker& getGlobalMessageBroker() {
-    static MessageBroker broker;
-    return broker;
-}
