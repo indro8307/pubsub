@@ -13,6 +13,7 @@
 #include <chrono>
 #include <atomic>
 #include <stdexcept>
+#include <memory>
 
 class Message {
 public:
@@ -32,33 +33,87 @@ private:
     size_t size;
 };
 
+enum class BackpressurePolicy {
+    Block,
+    DropOldest,
+    RejectNew
+};
+
+class MessageQueue;
+
+class MessageQueueConfig {
+public:
+    BackpressurePolicy backpressurePolicy = BackpressurePolicy::DropOldest;
+    size_t maxSize = 10000;
+};
+
+class BackPressureStrategy {
+public:
+    virtual bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) = 0;
+    virtual std::shared_ptr<const Message> try_dequeue(MessageQueue& mq) = 0;
+    virtual bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) = 0;
+    virtual ~BackPressureStrategy() = default;
+};
+
+class BlockBackPressureStrategy : public BackPressureStrategy {
+public:
+    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) override;
+    std::shared_ptr<const Message> try_dequeue(MessageQueue& mq) override;
+    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) override;
+};
+
+class DropOldestBackPressureStrategy : public BackPressureStrategy {
+public:
+    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) override;
+    std::shared_ptr<const Message> try_dequeue(MessageQueue& mq) override;
+    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) override;
+};
+
+class RejectNewBackPressureStrategy : public BackPressureStrategy {
+public:
+    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) override;
+    std::shared_ptr<const Message> try_dequeue(MessageQueue& mq) override;
+    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) override;
+};
+
 class MessageQueue {
 public:
-    void enqueue(std::shared_ptr<const Message> msg){
-        std::unique_lock<std::mutex> lock(mtx);
-        queue.push_back(msg);
-        cv.notify_one();
+    friend class BlockBackPressureStrategy;
+    friend class DropOldestBackPressureStrategy;
+    friend class RejectNewBackPressureStrategy;
+
+    MessageQueue(const MessageQueueConfig& config = MessageQueueConfig()) : config(config) 
+    {
+        switch(config.backpressurePolicy) {
+            case BackpressurePolicy::Block:
+                strategy_ = std::make_unique<BlockBackPressureStrategy>();
+                break;
+            case BackpressurePolicy::DropOldest:
+                strategy_ = std::make_unique<DropOldestBackPressureStrategy>();
+                break;
+            case BackpressurePolicy::RejectNew:
+                strategy_ = std::make_unique<RejectNewBackPressureStrategy>();
+                break;
+            default:
+                throw std::logic_error("Invalid backpressure policy");
+        }
+    }
+    bool enqueue(std::shared_ptr<const Message> msg){
+        return strategy_->try_enqueue(*this, msg);
     }
     std::shared_ptr<const Message> dequeue(){
-        std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [this]{ return !queue.empty(); });
-        std::shared_ptr<const Message> m = queue.front();
-        queue.pop_front();
-        return m;
+        return strategy_->try_dequeue(*this);
     }
-    bool dequeueFor(std::shared_ptr<const Message>& out, std::chrono::milliseconds timeout){
-        std::unique_lock<std::mutex> lock(mtx);
-        if (!cv.wait_for(lock, timeout, [this]{ return !queue.empty(); })) {
-            return false;
-        }
-        out = queue.front();
-        queue.pop_front();
-        return true;
+    bool dequeueFor(std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout){
+        return strategy_->try_dequeueFor(*this, out, timeout);
     }
 private:
     std::list<std::shared_ptr<const Message>> queue;
+    MessageQueueConfig config;
     std::mutex mtx;
-    std::condition_variable cv;
+    std::condition_variable not_empty_cv;
+    std::condition_variable not_full_cv;
+    std::unique_ptr<BackPressureStrategy> strategy_;
 };
 
 struct SubscriptionToken {
@@ -85,7 +140,14 @@ class MessageBroker {
     std::map<std::string, Topic> topics;
     mutable std::mutex topic_mtx;
     std::atomic<uint64_t> nextSubscriptionId_ = 1;
+    MessageQueueConfig config;
 public:
+    MessageBroker(const MessageQueueConfig& config = MessageQueueConfig()) : config(config) 
+    {
+        if (this->config.maxSize == 0) {
+            this->config.maxSize = 10000;
+        }
+    }
     SubscriptionToken subscribe(const std::string topic, const std::string group)
     {
         std::unique_lock<std::mutex> lock(topic_mtx);
@@ -94,7 +156,7 @@ public:
         group_it->second.memberCount++;
         uint64_t subscriptionId = nextSubscriptionId_.fetch_add(1);
         if (group_it->second.queue == nullptr) {
-            group_it->second.queue = std::make_shared<MessageQueue>();
+            group_it->second.queue = std::make_shared<MessageQueue>(config);
         }
         subscriptions[subscriptionId] = SubscriptionToken(topic, group, subscriptionId, group_it->second.queue);
         return subscriptions[subscriptionId];
@@ -157,7 +219,7 @@ public:
             auto [topic_it, topic_inserted] = topics.try_emplace(topic);
             auto [group_it, group_inserted] = topic_it->second.groups.try_emplace(group);
             if (group_it->second.queue == nullptr) {
-                group_it->second.queue = std::make_shared<MessageQueue>();
+                group_it->second.queue = std::make_shared<MessageQueue>(config);
             }
             group_it->second.queue->enqueue(std::make_shared<const Message>(std::move(msg)));
             return true;
