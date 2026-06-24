@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -15,6 +16,21 @@
 
 using namespace std::chrono_literals;
 using test_helpers::waitUntil;
+
+namespace {
+
+MessageQueueConfig backpressureConfig(BackpressurePolicy policy, size_t maxSize) {
+    MessageQueueConfig config;
+    config.backpressurePolicy = policy;
+    config.maxSize = maxSize;
+    return config;
+}
+
+std::string payloadToString(const Message& m) {
+    return std::string(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
+}
+
+}  // namespace
 
 TEST(FanoutRouting, TwoSubscribers_BothReceive) {
     MessageBroker broker;
@@ -282,4 +298,170 @@ TEST(FanoutStress, HundredPublishers_ThousandSubscribers_AllReceive) {
     EXPECT_EQ(broker.groupCount(topic), 0u);
     EXPECT_EQ(broker.totalGroupCount(), 0u);
     EXPECT_EQ(broker.subscriptionCount(), 0u);
+}
+
+TEST(FanoutBackpressure, DropOldest_DropsOldestWhenFull) {
+    constexpr size_t kMaxSize = 3;
+    constexpr int kPublishCount = 5;
+
+    MessageBroker broker(backpressureConfig(BackpressurePolicy::DropOldest, kMaxSize));
+    FanoutDispatcher dispatcher(broker);
+    Publisher pub(dispatcher);
+    const std::string topic = "bp-drop-oldest";
+
+    std::atomic<bool> processingPaused{true};
+    std::atomic<int> handlerInvocations{0};
+    std::vector<std::string> received;
+    std::mutex receivedMtx;
+
+    Subscriber sub(dispatcher);
+    sub.subscribe(topic, [&](const Message& m) {
+        const int invocation = handlerInvocations.fetch_add(1);
+        if (invocation == 0) {
+            while (processingPaused.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(1ms);
+            }
+        }
+        std::lock_guard<std::mutex> lock(receivedMtx);
+        received.push_back(payloadToString(m));
+    });
+
+    std::this_thread::sleep_for(50ms);
+    pub.publish(topic, "msg-0");
+
+    ASSERT_TRUE(waitUntil([&] { return handlerInvocations.load() >= 1; }));
+
+    for (int i = 1; i < kPublishCount; ++i) {
+        pub.publish(topic, "msg-" + std::to_string(i));
+    }
+
+    processingPaused.store(false, std::memory_order_release);
+
+    ASSERT_TRUE(waitUntil([&] {
+        std::lock_guard<std::mutex> lock(receivedMtx);
+        return received.size() == 4u;
+    }));
+
+    {
+        std::lock_guard<std::mutex> lock(receivedMtx);
+        ASSERT_EQ(received.size(), 4u);
+        EXPECT_EQ(received[0], "msg-0");
+        EXPECT_EQ(received[1], "msg-2");
+        EXPECT_EQ(received[2], "msg-3");
+        EXPECT_EQ(received[3], "msg-4");
+    }
+
+    sub.stop();
+}
+
+TEST(FanoutBackpressure, RejectNew_RejectsWhenFull) {
+    constexpr size_t kMaxSize = 3;
+    constexpr int kPublishCount = 5;
+
+    MessageBroker broker(backpressureConfig(BackpressurePolicy::RejectNew, kMaxSize));
+    FanoutDispatcher dispatcher(broker);
+    Publisher pub(dispatcher);
+    const std::string topic = "bp-reject-new";
+
+    std::atomic<bool> processingPaused{true};
+    std::atomic<int> handlerInvocations{0};
+    std::vector<std::string> received;
+    std::mutex receivedMtx;
+
+    Subscriber sub(dispatcher);
+    sub.subscribe(topic, [&](const Message& m) {
+        const int invocation = handlerInvocations.fetch_add(1);
+        if (invocation == 0) {
+            while (processingPaused.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(1ms);
+            }
+        }
+        std::lock_guard<std::mutex> lock(receivedMtx);
+        received.push_back(payloadToString(m));
+    });
+
+    std::this_thread::sleep_for(50ms);
+    pub.publish(topic, "msg-0");
+
+    ASSERT_TRUE(waitUntil([&] { return handlerInvocations.load() >= 1; }));
+
+    for (int i = 1; i < kPublishCount; ++i) {
+        pub.publish(topic, "msg-" + std::to_string(i));
+    }
+
+    processingPaused.store(false, std::memory_order_release);
+
+    ASSERT_TRUE(waitUntil([&] {
+        std::lock_guard<std::mutex> lock(receivedMtx);
+        return received.size() == 4u;
+    }));
+
+    {
+        std::lock_guard<std::mutex> lock(receivedMtx);
+        ASSERT_EQ(received.size(), 4u);
+        EXPECT_EQ(received[0], "msg-0");
+        EXPECT_EQ(received[1], "msg-1");
+        EXPECT_EQ(received[2], "msg-2");
+        EXPECT_EQ(received[3], "msg-3");
+    }
+
+    sub.stop();
+}
+
+TEST(FanoutBackpressure, Block_WaitsUntilSpace) {
+    constexpr size_t kMaxSize = 3;
+    constexpr int kPublishCount = 5;
+
+    MessageBroker broker(backpressureConfig(BackpressurePolicy::Block, kMaxSize));
+    FanoutDispatcher dispatcher(broker);
+    Publisher pub(dispatcher);
+    const std::string topic = "bp-block";
+
+    std::atomic<bool> processingPaused{true};
+    std::atomic<bool> publishDone{false};
+    std::atomic<int> handlerInvocations{0};
+    std::vector<std::string> received;
+    std::mutex receivedMtx;
+
+    Subscriber sub(dispatcher);
+    sub.subscribe(topic, [&](const Message& m) {
+        const int invocation = handlerInvocations.fetch_add(1);
+        if (invocation == 0) {
+            while (processingPaused.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(1ms);
+            }
+        }
+        std::lock_guard<std::mutex> lock(receivedMtx);
+        received.push_back(payloadToString(m));
+    });
+
+    std::this_thread::sleep_for(50ms);
+    pub.publish(topic, "msg-0");
+
+    ASSERT_TRUE(waitUntil([&] { return handlerInvocations.load() >= 1; }));
+
+    std::thread publishThread([&] {
+        for (int i = 1; i < kPublishCount; ++i) {
+            pub.publish(topic, "msg-" + std::to_string(i));
+        }
+        publishDone.store(true, std::memory_order_release);
+    });
+
+    processingPaused.store(false, std::memory_order_release);
+
+    ASSERT_TRUE(waitUntil([&] {
+        std::lock_guard<std::mutex> lock(receivedMtx);
+        return publishDone.load(std::memory_order_acquire) && received.size() == 5u;
+    }, 10s));
+
+    {
+        std::lock_guard<std::mutex> lock(receivedMtx);
+        ASSERT_EQ(received.size(), 5u);
+        for (int i = 0; i < kPublishCount; ++i) {
+            EXPECT_EQ(received[static_cast<std::size_t>(i)], "msg-" + std::to_string(i));
+        }
+    }
+
+    publishThread.join();
+    sub.stop();
 }
