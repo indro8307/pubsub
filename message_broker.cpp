@@ -2,6 +2,8 @@
 
 #include <stdexcept>
 #include <utility>
+#include <thread>
+#include <vector>
 
 MessageBroker::MessageBroker(const MessageQueueConfig& config) : config(config) {
     if (this->config.maxSize == 0) {
@@ -60,35 +62,77 @@ void MessageBroker::unsubscribe(const SubscriptionToken& token) {
 }
 
 bool MessageBroker::publish(const std::string topic, const std::string group, const Message& msg, bool buffer) {
-    std::unique_lock<std::mutex> lock(topic_mtx);
-    if (buffer) {
-        auto [topic_it, topic_inserted] = topics.try_emplace(topic);
-        auto [group_it, group_inserted] = topic_it->second.groups.try_emplace(group);
-        if (group_it->second.queue == nullptr) {
-            group_it->second.queue = std::make_shared<MessageQueue>(config);
+    // this method is called by the publisher to publish a message to a group which means only one queue.
+    auto message = std::make_shared<const Message>(msg);
+    std::shared_ptr<MessageQueue> mq;
+    {
+        std::unique_lock<std::mutex> lock(topic_mtx);
+
+        if (buffer) {
+            // if buffer is true it means we need to store the message even if no subscribers are present.
+            // so we need to create a new topic and group if they don't exist.
+            // and create a new message queue if it doesn't exist.
+            // and enqueue the message to the message queue.
+            auto [topic_it, topic_inserted] = topics.try_emplace(topic);
+            auto [group_it, group_inserted] = topic_it->second.groups.try_emplace(group);
+            if (group_it->second.queue == nullptr) {
+                group_it->second.queue = std::make_shared<MessageQueue>(config);
+            }        
+            mq = group_it->second.queue;
         }
-        group_it->second.queue->enqueue(std::make_shared<const Message>(msg));
-        return true;
+        else {
+            auto topic_it = topics.find(topic);
+            if (topic_it == topics.end()) {
+                return false;
+            }
+            auto group_it = topic_it->second.groups.find(group);
+            if (group_it == topic_it->second.groups.end()) {
+                return false;
+            }
+            mq = group_it->second.queue;
+        }
     }
-    auto topic_it = topics.find(topic);
-    if (topic_it == topics.end()) {
-        return false;
-    }
-    auto group_it = topic_it->second.groups.find(group);
-    if (group_it == topic_it->second.groups.end()) {
-        return false;
-    }
-    group_it->second.queue->enqueue(std::make_shared<const Message>(msg));
+    // enqueue the message to the message queue out of the lock 
+    // so that other threads can publish messages to other groups/topics.
+    // so if publish blocks in one group, it will not block other groups.
+    mq->enqueue(message);
     return true;
 }
 
 bool MessageBroker::publish(const std::string topic, const Message& msg) {
-    std::unique_lock<std::mutex> lock(topic_mtx);
-    if (topics.find(topic) == topics.end()) {
-        return false;
+    // Snapshot the target queues under topic_mtx, then enqueue outside the lock so a
+    // slow/full queue does not stall other publishers or subscribe/unsubscribe calls.
+    //
+    // TRADE-OFF (serial fan-out): queues are enqueued one at a time. With
+    // BackpressurePolicy::Block, a full queue blocks here until its consumer drains, which
+    // delays delivery to the queues later in iteration order (head-of-line blocking within
+    // a single publish). This is acceptable for now; non-blocking policies (DropOldest /
+    // RejectNew) are unaffected.
+    //
+    // TODO: if slow-subscriber isolation under Block becomes a requirement, fan out enqueues
+    // via a bounded thread pool (NOT a thread per queue, which does not scale to many
+    // subscribers) so one slow queue cannot hold up the rest.
+    auto message = std::make_shared<const Message>(msg);
+    std::vector<std::shared_ptr<MessageQueue>> mqs;
+    {
+        std::unique_lock<std::mutex> lock(topic_mtx);
+        auto topic_it = topics.find(topic);
+        if (topic_it == topics.end()) {
+            return false;
+        }
+        // Copy the queue shared_ptrs locally. The shared_ptr keeps each queue alive even if
+        // a concurrent unsubscribe removes the group from the map while we enqueue below.
+        for (auto& [group_name, group] : topic_it->second.groups) {
+            if (group.queue) {
+                mqs.push_back(group.queue);
+            }
+        }
     }
-    for (auto& group : topics[topic].groups) {
-        group.second.queue->enqueue(std::make_shared<const Message>(msg));
+
+    // Lock released: each MessageQueue has its own internal mutex, so concurrent enqueues
+    // are safe without holding topic_mtx.
+    for (auto& mq : mqs) {
+        mq->enqueue(message);
     }
     return true;
 }
