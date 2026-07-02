@@ -52,6 +52,7 @@ void MessageBroker::unsubscribe(const SubscriptionToken& token) {
     }
     decrementMemberCount(group_it->second);
     if (group_it->second.memberCount == 0) {
+        group_it->second.queue->close();
         group_it->second.queue.reset();
         topic_it->second.groups.erase(group_it);
     }

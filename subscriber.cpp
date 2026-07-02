@@ -22,7 +22,9 @@ void Subscriber::subscribe(const std::string& topic, Handler handler)
     worker = std::thread([this, handler, mq]() {
         while (state.load(std::memory_order_acquire) == SubscriberState::subscribed) {
             std::shared_ptr<const Message> m;
-            const bool gotMessage = mq->dequeueFor(m, std::chrono::milliseconds(100));
+            bool gotMessage = mq->dequeueUntil(m, [this] {
+                return state.load(std::memory_order_acquire) != SubscriberState::subscribed;
+            });
             if (!gotMessage) {
                 continue;
             }
@@ -38,6 +40,9 @@ void Subscriber::subscribe(const std::string& topic, Handler handler)
 void Subscriber::stop(){
     std::unique_lock<std::mutex> lock(subscriber_mtx);
     state.store(SubscriberState::stopped, std::memory_order_release);
+    if (token_.mq) {
+        token_.mq->wakeConsumers();
+    }
     if (worker.joinable()) {
         worker.join();
     }

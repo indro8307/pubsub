@@ -59,11 +59,14 @@ TEST(CompeteRouting, TwoSubscribers_OneMessage_OnlyOneReceives) {
     std::this_thread::sleep_for(50ms);
     pub.publish("orders", "only-one");
 
-    std::this_thread::sleep_for(2s);
-    EXPECT_EQ(sub1Count.load() + sub2Count.load(), 1);
+    ASSERT_TRUE(waitUntil([&] {
+        return sub1Count.load() + sub2Count.load() == 1;
+    }));
 
     s1.stop();
     s2.stop();
+
+    EXPECT_EQ(sub1Count.load() + sub2Count.load(), 1);
 }
 
 TEST(CompeteRouting, ThreeSubscribers_LargePayload_OnlyOneReceives) {
@@ -114,6 +117,10 @@ TEST(CompeteRouting, ThreeSubscribers_LargePayload_OnlyOneReceives) {
         return total == 1;
     }));
 
+    for (auto& sub : subscribers) {
+        sub->stop();
+    }
+
     int receivers = 0;
     int receiverIdx = -1;
     for (int i = 0; i < kSubscribers; ++i) {
@@ -130,10 +137,6 @@ TEST(CompeteRouting, ThreeSubscribers_LargePayload_OnlyOneReceives) {
     ASSERT_GE(receiverIdx, 0);
     EXPECT_EQ(receivedPayloads[static_cast<std::size_t>(receiverIdx)].size(), kPayloadSize);
     EXPECT_EQ(receivedPayloads[static_cast<std::size_t>(receiverIdx)], payload);
-
-    for (auto& sub : subscribers) {
-        sub->stop();
-    }
 }
 
 TEST(CompeteRouting, ManyMessages_TotalDeliveriesEqualsPublishCount) {
@@ -160,10 +163,10 @@ TEST(CompeteRouting, ManyMessages_TotalDeliveriesEqualsPublishCount) {
         return sub1Count.load() + sub2Count.load() == kMessages;
     }));
 
-    EXPECT_EQ(sub1Count.load() + sub2Count.load(), kMessages);
-
     s1.stop();
     s2.stop();
+
+    EXPECT_EQ(sub1Count.load() + sub2Count.load(), kMessages);
 }
 
 TEST(CompeteRouting, AfterOneStops_RemainingGetsAll) {
@@ -192,10 +195,10 @@ TEST(CompeteRouting, AfterOneStops_RemainingGetsAll) {
         return sub2Count.load() == kMessages;
     }));
 
+    s2.stop();
+
     EXPECT_EQ(sub1Count.load(), 0);
     EXPECT_EQ(sub2Count.load(), kMessages);
-
-    s2.stop();
 }
 
 TEST(CompeteRouting, Stop_UnsubscribesCompete) {
@@ -270,11 +273,11 @@ TEST(CompeteStress, ManyPublishersSubscribers_TotalDeliveriesMatch) {
         return totalDelivered.load(std::memory_order_relaxed) == kTotalMessages;
     }, 30s));
 
-    EXPECT_EQ(totalDelivered.load(std::memory_order_relaxed), kTotalMessages);
-
     for (auto& sub : subscribers) {
         sub->stop();
     }
+
+    EXPECT_EQ(totalDelivered.load(std::memory_order_relaxed), kTotalMessages);
 
     EXPECT_EQ(broker.groupCount(topic), 0u);
     EXPECT_EQ(broker.subscriptionCount(), 0u);
