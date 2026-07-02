@@ -57,15 +57,17 @@ TEST(FanoutRouting, TwoSubscribers_BothReceive) {
     std::this_thread::sleep_for(50ms);
     pub.publish("notifications", "broadcast");
 
-    std::this_thread::sleep_for(2s);
+    ASSERT_TRUE(waitUntil([&] {
+        return sub1Count.load() == 1 && sub2Count.load() == 1;
+    }));
+
+    s1.stop();
+    s2.stop();
 
     EXPECT_EQ(sub1Count.load(), 1);
     EXPECT_EQ(sub2Count.load(), 1);
     EXPECT_EQ(sub1Payload, "broadcast");
     EXPECT_EQ(sub2Payload, "broadcast");
-
-    s1.stop();
-    s2.stop();
 }
 
 TEST(FanoutRouting, TenSubscribers_LargePayload_AllReceive) {
@@ -111,15 +113,15 @@ TEST(FanoutRouting, TenSubscribers_LargePayload_AllReceive) {
         return true;
     }));
 
+    for (auto& sub : subscribers) {
+        sub->stop();
+    }
+
     for (int i = 0; i < kSubscribers; ++i) {
         EXPECT_EQ(receivedCounts[static_cast<std::size_t>(i)].load(), 1) << "subscriber " << i;
         EXPECT_EQ(receivedPayloads[static_cast<std::size_t>(i)].size(), kPayloadSize)
             << "subscriber " << i;
         EXPECT_EQ(receivedPayloads[static_cast<std::size_t>(i)], payload) << "subscriber " << i;
-    }
-
-    for (auto& sub : subscribers) {
-        sub->stop();
     }
 }
 
@@ -135,9 +137,8 @@ TEST(FanoutRouting, PublishBeforeSubscribe_MessageLost) {
     sub.subscribe("notifications", [&](const Message&) { ++count; });
 
     std::this_thread::sleep_for(500ms);
-    EXPECT_EQ(count.load(), 0);
-
     sub.stop();
+    EXPECT_EQ(count.load(), 0);
 }
 
 TEST(FanoutRouting, AfterStop_NoFurtherDelivery) {
@@ -180,11 +181,11 @@ TEST(FanoutRouting, TopicIsolation) {
 
     ASSERT_TRUE(waitUntil([&] { return topicACount.load() == 1; }));
 
-    EXPECT_EQ(topicACount.load(), 1);
-    EXPECT_EQ(topicBCount.load(), 0);
-
     subA.stop();
     subB.stop();
+
+    EXPECT_EQ(topicACount.load(), 1);
+    EXPECT_EQ(topicBCount.load(), 0);
 }
 
 TEST(FanoutRouting, UniqueGroupsPerSubscriber) {
@@ -283,6 +284,10 @@ TEST(FanoutStress, HundredPublishers_ThousandSubscribers_AllReceive) {
         return true;
     }, 120s));
 
+    for (auto& sub : subscribers) {
+        sub->stop();
+    }
+
     for (int i = 0; i < kSubscribers; ++i) {
         EXPECT_EQ(
             receivedCounts[static_cast<std::size_t>(i)].load(std::memory_order_relaxed),
@@ -290,9 +295,6 @@ TEST(FanoutStress, HundredPublishers_ThousandSubscribers_AllReceive) {
             << "subscriber " << i;
     }
 
-    for (auto& sub : subscribers) {
-        sub->stop();
-    }
     subscribers.clear();
 
     EXPECT_EQ(broker.groupCount(topic), 0u);

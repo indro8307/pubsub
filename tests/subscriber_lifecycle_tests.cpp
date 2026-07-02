@@ -123,8 +123,8 @@ TEST(SubscriberLifecycle, HandlerThrows_WorkerContinues) {
         return successfulAfterThrow.load() >= 1;
     }));
 
+    sub.stop();
+
     EXPECT_GE(handlerCalls.load(), 2);
     EXPECT_EQ(successfulAfterThrow.load(), 1);
-
-    sub.stop();
 }
