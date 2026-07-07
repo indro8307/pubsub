@@ -64,7 +64,8 @@ void MessageBroker::unsubscribe(const SubscriptionToken& token) {
 
 bool MessageBroker::publish(const std::string topic, const std::string group, const Message& msg, bool buffer) {
     // this method is called by the publisher to publish a message to a group which means only one queue.
-    auto message = std::make_shared<const Message>(msg);
+    auto payload = std::make_shared<const Message>(msg);
+    std::shared_ptr<const BrokerMessage> brokerMessage;
     std::shared_ptr<MessageQueue> mq;
     {
         std::unique_lock<std::mutex> lock(topic_mtx);
@@ -78,7 +79,9 @@ bool MessageBroker::publish(const std::string topic, const std::string group, co
             auto [group_it, group_inserted] = topic_it->second.groups.try_emplace(group);
             if (group_it->second.queue == nullptr) {
                 group_it->second.queue = std::make_shared<MessageQueue>(config);
-            }        
+            }
+            const uint64_t sequence = topic_it->second.nextSeq++;
+            brokerMessage = std::make_shared<const BrokerMessage>(sequence, payload);
             mq = group_it->second.queue;
         }
         else {
@@ -90,13 +93,15 @@ bool MessageBroker::publish(const std::string topic, const std::string group, co
             if (group_it == topic_it->second.groups.end()) {
                 return false;
             }
+            const uint64_t sequence = topic_it->second.nextSeq++;
+            brokerMessage = std::make_shared<const BrokerMessage>(sequence, payload);
             mq = group_it->second.queue;
         }
     }
     // enqueue the message to the message queue out of the lock 
     // so that other threads can publish messages to other groups/topics.
     // so if publish blocks in one group, it will not block other groups.
-    mq->enqueue(message);
+    mq->enqueue(brokerMessage);
     return true;
 }
 
@@ -113,7 +118,8 @@ bool MessageBroker::publish(const std::string topic, const Message& msg) {
     // TODO: if slow-subscriber isolation under Block becomes a requirement, fan out enqueues
     // via a bounded thread pool (NOT a thread per queue, which does not scale to many
     // subscribers) so one slow queue cannot hold up the rest.
-    auto message = std::make_shared<const Message>(msg);
+    auto payload = std::make_shared<const Message>(msg);
+    std::shared_ptr<const BrokerMessage> brokerMessage;
     std::vector<std::shared_ptr<MessageQueue>> mqs;
     {
         std::unique_lock<std::mutex> lock(topic_mtx);
@@ -121,6 +127,8 @@ bool MessageBroker::publish(const std::string topic, const Message& msg) {
         if (topic_it == topics.end()) {
             return false;
         }
+        const uint64_t sequence = topic_it->second.nextSeq++;
+        brokerMessage = std::make_shared<const BrokerMessage>(sequence, payload);
         // Copy the queue shared_ptrs locally. The shared_ptr keeps each queue alive even if
         // a concurrent unsubscribe removes the group from the map while we enqueue below.
         for (auto& [group_name, group] : topic_it->second.groups) {
@@ -133,7 +141,7 @@ bool MessageBroker::publish(const std::string topic, const Message& msg) {
     // Lock released: each MessageQueue has its own internal mutex, so concurrent enqueues
     // are safe without holding topic_mtx.
     for (auto& mq : mqs) {
-        mq->enqueue(message);
+        mq->enqueue(brokerMessage);
     }
     return true;
 }

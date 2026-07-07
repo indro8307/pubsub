@@ -21,7 +21,7 @@ void Subscriber::subscribe(const std::string& topic, Handler handler)
     MessageQueue* const mq = token_.mq.get();
     worker = std::thread([this, handler, mq]() {
         while (state.load(std::memory_order_acquire) == SubscriberState::subscribed) {
-            std::shared_ptr<const Message> m;
+            std::shared_ptr<const BrokerMessage> m;
             bool gotMessage = mq->dequeueUntil(m, [this] {
                 return state.load(std::memory_order_acquire) != SubscriberState::subscribed;
             });

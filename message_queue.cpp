@@ -1,6 +1,6 @@
 #include "message_queue.h"
 
-bool BlockBackPressureStrategy::try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) {
+bool BlockBackPressureStrategy::try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     mq.not_full_cv.wait(lock, [&mq]{ return mq.isClosed() || mq.queue.size() < mq.config.maxSize; });
     if (mq.isClosed()) {
@@ -11,7 +11,7 @@ bool BlockBackPressureStrategy::try_enqueue(MessageQueue& mq, const std::shared_
     return true;
 }
 
-std::shared_ptr<const Message> BlockBackPressureStrategy::try_dequeue(MessageQueue& mq) {
+std::shared_ptr<const BrokerMessage> BlockBackPressureStrategy::try_dequeue(MessageQueue& mq) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     mq.not_empty_cv.wait(lock, [&mq]{ return mq.isClosed() || !mq.queue.empty(); });
     if (mq.isClosed()) {
@@ -20,13 +20,13 @@ std::shared_ptr<const Message> BlockBackPressureStrategy::try_dequeue(MessageQue
     if (mq.queue.empty()) {
         return nullptr;
     }
-    std::shared_ptr<const Message> msg = mq.queue.front();
+    std::shared_ptr<const BrokerMessage> msg = mq.queue.front();
     mq.queue.pop_front();
     mq.not_full_cv.notify_one();
     return msg;
 }
 
-bool BlockBackPressureStrategy::try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) {
+bool BlockBackPressureStrategy::try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     if (!mq.not_empty_cv.wait_for(lock, timeout, [&mq]{ return mq.isClosed() || !mq.queue.empty(); })) {
         return false;
@@ -44,7 +44,7 @@ bool BlockBackPressureStrategy::try_dequeueFor(MessageQueue& mq, std::shared_ptr
     return true;
 }
 
-bool BlockBackPressureStrategy::try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::function<bool()>& predicate) {
+bool BlockBackPressureStrategy::try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     mq.not_empty_cv.wait(lock, [&mq, &predicate]{ return mq.isClosed() || !mq.queue.empty() || predicate(); });
     if (mq.isClosed() || mq.queue.empty() || predicate()) {
@@ -57,7 +57,7 @@ bool BlockBackPressureStrategy::try_dequeueUntil(MessageQueue& mq, std::shared_p
     return true;
 }
 
-bool DropOldestBackPressureStrategy::try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) {
+bool DropOldestBackPressureStrategy::try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     if (mq.isClosed()) {
         return false;
@@ -73,7 +73,7 @@ bool DropOldestBackPressureStrategy::try_enqueue(MessageQueue& mq, const std::sh
     return true;
 }
 
-std::shared_ptr<const Message> DropOldestBackPressureStrategy::try_dequeue(MessageQueue& mq) {
+std::shared_ptr<const BrokerMessage> DropOldestBackPressureStrategy::try_dequeue(MessageQueue& mq) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     mq.not_empty_cv.wait(lock, [&mq]{ return mq.isClosed() || !mq.queue.empty(); });
     if (mq.isClosed()) {
@@ -82,12 +82,12 @@ std::shared_ptr<const Message> DropOldestBackPressureStrategy::try_dequeue(Messa
     if (mq.queue.empty()) {
         return nullptr;
     }
-    std::shared_ptr<const Message> msg = mq.queue.front();
+    std::shared_ptr<const BrokerMessage> msg = mq.queue.front();
     mq.queue.pop_front();
     return msg;
 }
 
-bool DropOldestBackPressureStrategy::try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) {
+bool DropOldestBackPressureStrategy::try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     if (!mq.not_empty_cv.wait_for(lock, timeout, [&mq]{ return mq.isClosed() || !mq.queue.empty(); })) {
         return false;
@@ -104,7 +104,7 @@ bool DropOldestBackPressureStrategy::try_dequeueFor(MessageQueue& mq, std::share
     return true;
 }
 
-bool DropOldestBackPressureStrategy::try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::function<bool()>& predicate) {
+bool DropOldestBackPressureStrategy::try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     mq.not_empty_cv.wait(lock, [&mq, &predicate]{ return mq.isClosed() || !mq.queue.empty() || predicate(); });
     if (mq.isClosed() || mq.queue.empty() || predicate()) {
@@ -116,7 +116,7 @@ bool DropOldestBackPressureStrategy::try_dequeueUntil(MessageQueue& mq, std::sha
     return true;
 }
 
-bool RejectNewBackPressureStrategy::try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) {
+bool RejectNewBackPressureStrategy::try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     if (mq.isClosed()) {
         return false;
@@ -129,7 +129,7 @@ bool RejectNewBackPressureStrategy::try_enqueue(MessageQueue& mq, const std::sha
     return true;
 }
 
-std::shared_ptr<const Message> RejectNewBackPressureStrategy::try_dequeue(MessageQueue& mq) {
+std::shared_ptr<const BrokerMessage> RejectNewBackPressureStrategy::try_dequeue(MessageQueue& mq) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     mq.not_empty_cv.wait(lock, [&mq]{ return mq.isClosed() || !mq.queue.empty(); });
     if (mq.isClosed()) {
@@ -138,12 +138,12 @@ std::shared_ptr<const Message> RejectNewBackPressureStrategy::try_dequeue(Messag
     if (mq.queue.empty()) {
         return nullptr;
     }
-    std::shared_ptr<const Message> msg = mq.queue.front();
+    std::shared_ptr<const BrokerMessage> msg = mq.queue.front();
     mq.queue.pop_front();
     return msg;
 }
 
-bool RejectNewBackPressureStrategy::try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) {
+bool RejectNewBackPressureStrategy::try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     if (!mq.not_empty_cv.wait_for(lock, timeout, [&mq]{ return mq.isClosed() || !mq.queue.empty(); })) {
         return false;
@@ -160,7 +160,7 @@ bool RejectNewBackPressureStrategy::try_dequeueFor(MessageQueue& mq, std::shared
     return true;
 }
 
-bool RejectNewBackPressureStrategy::try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::function<bool()>& predicate) {
+bool RejectNewBackPressureStrategy::try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) {
     std::unique_lock<std::mutex> lock(mq.mtx);
     mq.not_empty_cv.wait(lock, [&mq, &predicate]{ return mq.isClosed() || !mq.queue.empty() || predicate(); });
     if (mq.isClosed() || mq.queue.empty() || predicate()) {

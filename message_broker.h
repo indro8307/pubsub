@@ -29,6 +29,7 @@ class MessageBroker {
     };
     struct Topic {
         std::map<std::string, Group> groups;
+        uint64_t nextSeq = 1;
     };
     std::map<uint64_t, SubscriptionToken> subscriptions;
     std::map<std::string, Topic> topics;

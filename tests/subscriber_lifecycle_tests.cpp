@@ -21,9 +21,9 @@ TEST(SubscriberLifecycle, DoubleSubscribe_Throws) {
     FanoutDispatcher dispatcher(broker);
     Subscriber sub(dispatcher);
 
-    sub.subscribe("t", [](const Message&) {});
+    sub.subscribe("t", [](const BrokerMessage&) {});
 
-    EXPECT_THROW(sub.subscribe("t", [](const Message&) {}), std::logic_error);
+    EXPECT_THROW(sub.subscribe("t", [](const BrokerMessage&) {}), std::logic_error);
 
     sub.stop();
 }
@@ -33,7 +33,7 @@ TEST(SubscriberLifecycle, Stop_NoHang) {
     CompeteConsumerDispatcher dispatcher(broker);
     Subscriber sub(dispatcher);
 
-    sub.subscribe("hang-test", [](const Message&) {
+    sub.subscribe("hang-test", [](const BrokerMessage&) {
         std::this_thread::sleep_for(5ms);
     });
 
@@ -61,7 +61,7 @@ TEST(SubscriberLifecycle, DoubleStop_NoHang) {
     FanoutDispatcher dispatcher(broker);
     Subscriber sub(dispatcher);
 
-    sub.subscribe("t", [](const Message&) {});
+    sub.subscribe("t", [](const BrokerMessage&) {});
 
     sub.stop();
 
@@ -77,10 +77,10 @@ TEST(SubscriberLifecycle, SubscribeAfterStop_Throws) {
     FanoutDispatcher dispatcher(broker);
     Subscriber sub(dispatcher);
 
-    sub.subscribe("t", [](const Message&) {});
+    sub.subscribe("t", [](const BrokerMessage&) {});
     sub.stop();
 
-    EXPECT_THROW(sub.subscribe("t", [](const Message&) {}), std::logic_error);
+    EXPECT_THROW(sub.subscribe("t", [](const BrokerMessage&) {}), std::logic_error);
 }
 
 TEST(SubscriberLifecycle, DestructorUnsubscribes) {
@@ -90,7 +90,7 @@ TEST(SubscriberLifecycle, DestructorUnsubscribes) {
 
     {
         auto sub = std::make_unique<Subscriber>(dispatcher);
-        sub->subscribe(topic, [](const Message&) {});
+        sub->subscribe(topic, [](const BrokerMessage&) {});
         ASSERT_EQ(broker.groupCount(topic), 1u);
     }
 
@@ -107,7 +107,7 @@ TEST(SubscriberLifecycle, HandlerThrows_WorkerContinues) {
     std::atomic<int> successfulAfterThrow{0};
 
     Subscriber sub(dispatcher);
-    sub.subscribe("errors", [&](const Message&) {
+    sub.subscribe("errors", [&](const BrokerMessage&) {
         const int n = ++handlerCalls;
         if (n == 1) {
             throw std::runtime_error("simulated handler failure");

@@ -30,6 +30,17 @@ private:
     size_t size;
 };
 
+class BrokerMessage {
+public:
+    BrokerMessage(uint64_t sequence, std::shared_ptr<const Message> message)
+        : sequence_(sequence), message_(std::move(message)) {}
+    uint64_t getSequence() const { return sequence_; }
+    const Message& payload() const { return *message_; }
+private:
+    uint64_t sequence_;
+    std::shared_ptr<const Message> message_;
+};
+
 enum class BackpressurePolicy {
     Block,
     DropOldest,
@@ -46,35 +57,35 @@ public:
 
 class BackPressureStrategy {
 public:
-    virtual bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) = 0;
-    virtual std::shared_ptr<const Message> try_dequeue(MessageQueue& mq) = 0;
-    virtual bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) = 0;
-    virtual bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::function<bool()>& predicate) = 0;
+    virtual bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) = 0;
+    virtual std::shared_ptr<const BrokerMessage> try_dequeue(MessageQueue& mq) = 0;
+    virtual bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) = 0;
+    virtual bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) = 0;
     virtual ~BackPressureStrategy() = default;
 };
 
 class BlockBackPressureStrategy : public BackPressureStrategy {
 public:
-    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) override;
-    std::shared_ptr<const Message> try_dequeue(MessageQueue& mq) override;
-    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) override;
-    bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::function<bool()>& predicate) override;
+    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) override;
+    std::shared_ptr<const BrokerMessage> try_dequeue(MessageQueue& mq) override;
+    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) override;
+    bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) override;
 };
 
 class DropOldestBackPressureStrategy : public BackPressureStrategy {
 public:
-    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) override;
-    std::shared_ptr<const Message> try_dequeue(MessageQueue& mq) override;
-    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) override;
-    bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::function<bool()>& predicate) override;
+    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) override;
+    std::shared_ptr<const BrokerMessage> try_dequeue(MessageQueue& mq) override;
+    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) override;
+    bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) override;
 };
 
 class RejectNewBackPressureStrategy : public BackPressureStrategy {
 public:
-    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const Message>& msg) override;
-    std::shared_ptr<const Message> try_dequeue(MessageQueue& mq) override;
-    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout) override;
-    bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const Message>& out, const std::function<bool()>& predicate) override;
+    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) override;
+    std::shared_ptr<const BrokerMessage> try_dequeue(MessageQueue& mq) override;
+    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) override;
+    bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) override;
 };
 
 class MessageQueue {
@@ -99,16 +110,16 @@ public:
                 throw std::logic_error("Invalid backpressure policy");
         }
     }
-    bool enqueue(std::shared_ptr<const Message> msg){
+    bool enqueue(std::shared_ptr<const BrokerMessage> msg){
         return strategy_->try_enqueue(*this, msg);
     }
-    std::shared_ptr<const Message> dequeue(){
+    std::shared_ptr<const BrokerMessage> dequeue(){
         return strategy_->try_dequeue(*this);
     }
-    bool dequeueFor(std::shared_ptr<const Message>& out, const std::chrono::milliseconds& timeout){
+    bool dequeueFor(std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout){
         return strategy_->try_dequeueFor(*this, out, timeout);
     }
-    bool dequeueUntil(std::shared_ptr<const Message>& out, const std::function<bool()>& predicate){
+    bool dequeueUntil(std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate){
         return strategy_->try_dequeueUntil(*this, out, predicate);
     }
     bool isClosed() const {
@@ -124,7 +135,7 @@ public:
         not_empty_cv.notify_all();
     }
 private:
-    std::list<std::shared_ptr<const Message>> queue;
+    std::list<std::shared_ptr<const BrokerMessage>> queue;
     MessageQueueConfig config;
     std::mutex mtx;
     std::condition_variable not_empty_cv;

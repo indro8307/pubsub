@@ -26,8 +26,33 @@ MessageQueueConfig backpressureConfig(BackpressurePolicy policy, size_t maxSize)
     return config;
 }
 
-std::string payloadToString(const Message& m) {
+std::string payloadToString(const BrokerMessage& bm) {
+    const Message& m = bm.payload();
     return std::string(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
+}
+
+std::vector<int> makeSequenceCounts(int expectedCount) {
+    return std::vector<int>(static_cast<std::size_t>(expectedCount), 0);
+}
+
+void recordSequence(std::vector<int>& counts, uint64_t sequence) {
+    const std::size_t index = static_cast<std::size_t>(sequence - 1);
+    ASSERT_LT(index, counts.size());
+    ++counts[index];
+}
+
+int totalRecorded(const std::vector<int>& counts) {
+    int total = 0;
+    for (int count : counts) {
+        total += count;
+    }
+    return total;
+}
+
+void expectEachSequenceOnce(const std::vector<int>& counts) {
+    for (std::size_t i = 0; i < counts.size(); ++i) {
+        EXPECT_EQ(counts[i], 1) << "sequence " << (i + 1);
+    }
 }
 
 }  // namespace
@@ -43,13 +68,15 @@ TEST(CompeteRouting, TwoSubscribers_OneMessage_OnlyOneReceives) {
     Subscriber s1(dispatcher);
     Subscriber s2(dispatcher);
 
-    s1.subscribe("orders", [&](const Message& m) {
+    s1.subscribe("orders", [&](const BrokerMessage& bm) {
+        const Message& m = bm.payload();
         std::string payload(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
         if (payload == "only-one") {
             ++sub1Count;
         }
     });
-    s2.subscribe("orders", [&](const Message& m) {
+    s2.subscribe("orders", [&](const BrokerMessage& bm) {
+        const Message& m = bm.payload();
         std::string payload(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
         if (payload == "only-one") {
             ++sub2Count;
@@ -67,6 +94,64 @@ TEST(CompeteRouting, TwoSubscribers_OneMessage_OnlyOneReceives) {
     s2.stop();
 
     EXPECT_EQ(sub1Count.load() + sub2Count.load(), 1);
+}
+
+TEST(CompeteRouting, MultiplePublishers_CollectivelyReceiveAllSequences) {
+    constexpr int kPublishers = 5;
+    constexpr int kMessagesPerPublisher = 10;
+    constexpr int kSubscribers = 3;
+    constexpr int kTotalMessages = kPublishers * kMessagesPerPublisher;
+
+    MessageBroker broker;
+    CompeteConsumerDispatcher dispatcher(broker);
+    const std::string topic = "seq-compete";
+
+    std::mutex seqMutex;
+    std::vector<int> sequenceCounts = makeSequenceCounts(kTotalMessages);
+
+    std::vector<std::unique_ptr<Subscriber>> subscribers;
+    subscribers.reserve(static_cast<std::size_t>(kSubscribers));
+    for (int i = 0; i < kSubscribers; ++i) {
+        subscribers.push_back(std::make_unique<Subscriber>(dispatcher));
+        subscribers.back()->subscribe(topic, [&](const BrokerMessage& bm) {
+            std::lock_guard<std::mutex> lock(seqMutex);
+            recordSequence(sequenceCounts, bm.getSequence());
+        });
+    }
+
+    std::this_thread::sleep_for(50ms);
+
+    std::vector<std::unique_ptr<Publisher>> publishers;
+    publishers.reserve(static_cast<std::size_t>(kPublishers));
+    for (int i = 0; i < kPublishers; ++i) {
+        publishers.push_back(std::make_unique<Publisher>(dispatcher));
+    }
+
+    std::vector<std::thread> publishThreads;
+    publishThreads.reserve(static_cast<std::size_t>(kPublishers));
+    for (int pubIdx = 0; pubIdx < kPublishers; ++pubIdx) {
+        publishThreads.emplace_back([&publishers, &topic, pubIdx]() {
+            for (int msgIdx = 0; msgIdx < kMessagesPerPublisher; ++msgIdx) {
+                publishers[static_cast<std::size_t>(pubIdx)]->publish(
+                    topic,
+                    "pub" + std::to_string(pubIdx) + "_msg" + std::to_string(msgIdx));
+            }
+        });
+    }
+    for (auto& t : publishThreads) {
+        t.join();
+    }
+
+    ASSERT_TRUE(waitUntil([&]() {
+        std::lock_guard<std::mutex> lock(seqMutex);
+        return totalRecorded(sequenceCounts) == kTotalMessages;
+    }));
+
+    for (auto& sub : subscribers) {
+        sub->stop();
+    }
+
+    expectEachSequenceOnce(sequenceCounts);
 }
 
 TEST(CompeteRouting, ThreeSubscribers_LargePayload_OnlyOneReceives) {
@@ -93,7 +178,8 @@ TEST(CompeteRouting, ThreeSubscribers_LargePayload_OnlyOneReceives) {
         receivedCounts[static_cast<std::size_t>(i)].store(0);
         subscribers.push_back(std::make_unique<Subscriber>(dispatcher));
         const int subIdx = i;
-        subscribers.back()->subscribe(topic, [&, subIdx](const Message& m) {
+        subscribers.back()->subscribe(topic, [&, subIdx](const BrokerMessage& bm) {
+            const Message& m = bm.payload();
             if (m.getSize() != kPayloadSize) {
                 return;
             }
@@ -151,8 +237,8 @@ TEST(CompeteRouting, ManyMessages_TotalDeliveriesEqualsPublishCount) {
     Subscriber s1(dispatcher);
     Subscriber s2(dispatcher);
 
-    s1.subscribe("orders", [&](const Message&) { ++sub1Count; });
-    s2.subscribe("orders", [&](const Message&) { ++sub2Count; });
+    s1.subscribe("orders", [&](const BrokerMessage&) { ++sub1Count; });
+    s2.subscribe("orders", [&](const BrokerMessage&) { ++sub2Count; });
 
     std::this_thread::sleep_for(50ms);
     for (int i = 0; i < kMessages; ++i) {
@@ -181,8 +267,8 @@ TEST(CompeteRouting, AfterOneStops_RemainingGetsAll) {
     Subscriber s1(dispatcher);
     Subscriber s2(dispatcher);
 
-    s1.subscribe("orders", [&](const Message&) { ++sub1Count; });
-    s2.subscribe("orders", [&](const Message&) { ++sub2Count; });
+    s1.subscribe("orders", [&](const BrokerMessage&) { ++sub1Count; });
+    s2.subscribe("orders", [&](const BrokerMessage&) { ++sub2Count; });
 
     std::this_thread::sleep_for(50ms);
     s1.stop();
@@ -209,8 +295,8 @@ TEST(CompeteRouting, Stop_UnsubscribesCompete) {
     Subscriber s1(dispatcher);
     Subscriber s2(dispatcher);
 
-    s1.subscribe(topic, [](const Message&) {});
-    s2.subscribe(topic, [](const Message&) {});
+    s1.subscribe(topic, [](const BrokerMessage&) {});
+    s2.subscribe(topic, [](const BrokerMessage&) {});
 
     ASSERT_EQ(broker.groupCount(topic), 1u);
     ASSERT_EQ(broker.subscriptionCount(), 2u);
@@ -239,7 +325,7 @@ TEST(CompeteStress, ManyPublishersSubscribers_TotalDeliveriesMatch) {
     subscribers.reserve(static_cast<std::size_t>(kSubscribers));
     for (int i = 0; i < kSubscribers; ++i) {
         subscribers.push_back(std::make_unique<Subscriber>(dispatcher));
-        subscribers.back()->subscribe(topic, [&totalDelivered](const Message&) {
+        subscribers.back()->subscribe(topic, [&totalDelivered](const BrokerMessage&) {
             totalDelivered.fetch_add(1, std::memory_order_relaxed);
         });
     }
@@ -298,7 +384,7 @@ TEST(CompeteBackpressure, DropOldest_DropsOldestWhenFull) {
     std::mutex receivedMtx;
 
     Subscriber sub(dispatcher);
-    sub.subscribe(topic, [&](const Message& m) {
+    sub.subscribe(topic, [&](const BrokerMessage& m) {
         const int invocation = handlerInvocations.fetch_add(1);
         if (invocation == 0) {
             while (processingPaused.load(std::memory_order_acquire)) {
@@ -352,7 +438,7 @@ TEST(CompeteBackpressure, RejectNew_RejectsWhenFull) {
     std::mutex receivedMtx;
 
     Subscriber sub(dispatcher);
-    sub.subscribe(topic, [&](const Message& m) {
+    sub.subscribe(topic, [&](const BrokerMessage& m) {
         const int invocation = handlerInvocations.fetch_add(1);
         if (invocation == 0) {
             while (processingPaused.load(std::memory_order_acquire)) {
@@ -407,7 +493,7 @@ TEST(CompeteBackpressure, Block_WaitsUntilSpace) {
     std::mutex receivedMtx;
 
     Subscriber sub(dispatcher);
-    sub.subscribe(topic, [&](const Message& m) {
+    sub.subscribe(topic, [&](const BrokerMessage& m) {
         const int invocation = handlerInvocations.fetch_add(1);
         if (invocation == 0) {
             while (processingPaused.load(std::memory_order_acquire)) {

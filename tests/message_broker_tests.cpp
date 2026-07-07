@@ -127,15 +127,17 @@ TEST(MessageBrokerTest, PublishToTopic_BroadcastsToAllGroups) {
     msg.setPayload(reinterpret_cast<const uint8_t*>("hello"), 5);
     ASSERT_TRUE(broker.publish(topic, msg));
 
-    std::shared_ptr<const Message> received1;
-    std::shared_ptr<const Message> received2;
+    std::shared_ptr<const BrokerMessage> received1;
+    std::shared_ptr<const BrokerMessage> received2;
     ASSERT_TRUE(sub1.mq->dequeueFor(received1, 500ms));
     ASSERT_TRUE(sub2.mq->dequeueFor(received2, 500ms));
 
-    EXPECT_EQ(received1->getId(), 42);
-    EXPECT_EQ(received2->getId(), 42);
-    EXPECT_EQ(std::string(reinterpret_cast<const char*>(received1->getPayload()), received1->getSize()), "hello");
-    EXPECT_EQ(std::string(reinterpret_cast<const char*>(received2->getPayload()), received2->getSize()), "hello");
+    EXPECT_EQ(received1->getSequence(), 1u);
+    EXPECT_EQ(received2->getSequence(), 1u);
+    EXPECT_EQ(received1->payload().getId(), 42);
+    EXPECT_EQ(received2->payload().getId(), 42);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(received1->payload().getPayload()), received1->payload().getSize()), "hello");
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(received2->payload().getPayload()), received2->payload().getSize()), "hello");
 
     broker.unsubscribe(sub1);
     broker.unsubscribe(sub2);

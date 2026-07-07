@@ -26,8 +26,33 @@ MessageQueueConfig backpressureConfig(BackpressurePolicy policy, size_t maxSize)
     return config;
 }
 
-std::string payloadToString(const Message& m) {
+std::string payloadToString(const BrokerMessage& bm) {
+    const Message& m = bm.payload();
     return std::string(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
+}
+
+std::vector<int> makeSequenceCounts(int expectedCount) {
+    return std::vector<int>(static_cast<std::size_t>(expectedCount), 0);
+}
+
+void recordSequence(std::vector<int>& counts, uint64_t sequence) {
+    const std::size_t index = static_cast<std::size_t>(sequence - 1);
+    ASSERT_LT(index, counts.size());
+    ++counts[index];
+}
+
+int totalRecorded(const std::vector<int>& counts) {
+    int total = 0;
+    for (int count : counts) {
+        total += count;
+    }
+    return total;
+}
+
+void expectEachSequenceOnce(const std::vector<int>& counts) {
+    for (std::size_t i = 0; i < counts.size(); ++i) {
+        EXPECT_EQ(counts[i], 1) << "sequence " << (i + 1);
+    }
 }
 
 }  // namespace
@@ -45,11 +70,13 @@ TEST(FanoutRouting, TwoSubscribers_BothReceive) {
     Subscriber s1(dispatcher);
     Subscriber s2(dispatcher);
 
-    s1.subscribe("notifications", [&](const Message& m) {
+    s1.subscribe("notifications", [&](const BrokerMessage& bm) {
+        const Message& m = bm.payload();
         ++sub1Count;
         sub1Payload = std::string(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
     });
-    s2.subscribe("notifications", [&](const Message& m) {
+    s2.subscribe("notifications", [&](const BrokerMessage& bm) {
+        const Message& m = bm.payload();
         ++sub2Count;
         sub2Payload = std::string(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
     });
@@ -68,6 +95,75 @@ TEST(FanoutRouting, TwoSubscribers_BothReceive) {
     EXPECT_EQ(sub2Count.load(), 1);
     EXPECT_EQ(sub1Payload, "broadcast");
     EXPECT_EQ(sub2Payload, "broadcast");
+}
+
+TEST(FanoutRouting, MultiplePublishers_EachSubscriberReceivesAllSequences) {
+    constexpr int kPublishers = 5;
+    constexpr int kMessagesPerPublisher = 10;
+    constexpr int kSubscribers = 3;
+    constexpr int kTotalMessages = kPublishers * kMessagesPerPublisher;
+
+    MessageBroker broker;
+    FanoutDispatcher dispatcher(broker);
+    const std::string topic = "seq-fanout";
+
+    std::vector<std::mutex> seqMutexes(static_cast<std::size_t>(kSubscribers));
+    std::vector<std::vector<int>> sequenceCounts(static_cast<std::size_t>(kSubscribers));
+    for (int i = 0; i < kSubscribers; ++i) {
+        sequenceCounts[static_cast<std::size_t>(i)] = makeSequenceCounts(kTotalMessages);
+    }
+
+    std::vector<std::unique_ptr<Subscriber>> subscribers;
+    subscribers.reserve(static_cast<std::size_t>(kSubscribers));
+    for (int i = 0; i < kSubscribers; ++i) {
+        subscribers.push_back(std::make_unique<Subscriber>(dispatcher));
+        const int subIdx = i;
+        subscribers.back()->subscribe(topic, [&, subIdx](const BrokerMessage& bm) {
+            std::lock_guard<std::mutex> lock(seqMutexes[static_cast<std::size_t>(subIdx)]);
+            recordSequence(sequenceCounts[static_cast<std::size_t>(subIdx)], bm.getSequence());
+        });
+    }
+
+    std::this_thread::sleep_for(50ms);
+
+    std::vector<std::unique_ptr<Publisher>> publishers;
+    publishers.reserve(static_cast<std::size_t>(kPublishers));
+    for (int i = 0; i < kPublishers; ++i) {
+        publishers.push_back(std::make_unique<Publisher>(dispatcher));
+    }
+
+    std::vector<std::thread> publishThreads;
+    publishThreads.reserve(static_cast<std::size_t>(kPublishers));
+    for (int pubIdx = 0; pubIdx < kPublishers; ++pubIdx) {
+        publishThreads.emplace_back([&publishers, &topic, pubIdx]() {
+            for (int msgIdx = 0; msgIdx < kMessagesPerPublisher; ++msgIdx) {
+                publishers[static_cast<std::size_t>(pubIdx)]->publish(
+                    topic,
+                    "pub" + std::to_string(pubIdx) + "_msg" + std::to_string(msgIdx));
+            }
+        });
+    }
+    for (auto& t : publishThreads) {
+        t.join();
+    }
+
+    ASSERT_TRUE(waitUntil([&]() {
+        for (int i = 0; i < kSubscribers; ++i) {
+            std::lock_guard<std::mutex> lock(seqMutexes[static_cast<std::size_t>(i)]);
+            if (totalRecorded(sequenceCounts[static_cast<std::size_t>(i)]) != kTotalMessages) {
+                return false;
+            }
+        }
+        return true;
+    }));
+
+    for (auto& sub : subscribers) {
+        sub->stop();
+    }
+
+    for (int i = 0; i < kSubscribers; ++i) {
+        expectEachSequenceOnce(sequenceCounts[static_cast<std::size_t>(i)]);
+    }
 }
 
 TEST(FanoutRouting, TenSubscribers_LargePayload_AllReceive) {
@@ -94,8 +190,9 @@ TEST(FanoutRouting, TenSubscribers_LargePayload_AllReceive) {
         receivedCounts[static_cast<std::size_t>(i)].store(0);
         subscribers.push_back(std::make_unique<Subscriber>(dispatcher));
         const int subIdx = i;
-        subscribers.back()->subscribe(topic, [&, subIdx](const Message& m) {
+        subscribers.back()->subscribe(topic, [&, subIdx](const BrokerMessage& bm) {
             receivedCounts[static_cast<std::size_t>(subIdx)].fetch_add(1);
+            const Message& m = bm.payload();
             receivedPayloads[static_cast<std::size_t>(subIdx)] =
                 std::string(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
         });
@@ -134,7 +231,7 @@ TEST(FanoutRouting, PublishBeforeSubscribe_MessageLost) {
 
     std::atomic<int> count{0};
     Subscriber sub(dispatcher);
-    sub.subscribe("notifications", [&](const Message&) { ++count; });
+    sub.subscribe("notifications", [&](const BrokerMessage&) { ++count; });
 
     std::this_thread::sleep_for(500ms);
     sub.stop();
@@ -148,7 +245,7 @@ TEST(FanoutRouting, AfterStop_NoFurtherDelivery) {
 
     std::atomic<int> count{0};
     Subscriber sub(dispatcher);
-    sub.subscribe("notifications", [&](const Message&) { ++count; });
+    sub.subscribe("notifications", [&](const BrokerMessage&) { ++count; });
 
     std::this_thread::sleep_for(50ms);
     pub.publish("notifications", "first");
@@ -173,8 +270,8 @@ TEST(FanoutRouting, TopicIsolation) {
     Subscriber subA(dispatcher);
     Subscriber subB(dispatcher);
 
-    subA.subscribe("topic-a", [&](const Message&) { ++topicACount; });
-    subB.subscribe("topic-b", [&](const Message&) { ++topicBCount; });
+    subA.subscribe("topic-a", [&](const BrokerMessage&) { ++topicACount; });
+    subB.subscribe("topic-b", [&](const BrokerMessage&) { ++topicBCount; });
 
     std::this_thread::sleep_for(50ms);
     pub.publish("topic-a", "for-a");
@@ -210,8 +307,8 @@ TEST(FanoutRouting, Stop_UnsubscribesFanout) {
     Subscriber s1(dispatcher);
     Subscriber s2(dispatcher);
 
-    s1.subscribe(topic, [](const Message&) {});
-    s2.subscribe(topic, [](const Message&) {});
+    s1.subscribe(topic, [](const BrokerMessage&) {});
+    s2.subscribe(topic, [](const BrokerMessage&) {});
 
     ASSERT_EQ(broker.groupCount(topic), 2u);
 
@@ -243,7 +340,7 @@ TEST(FanoutStress, HundredPublishers_ThousandSubscribers_AllReceive) {
     for (int i = 0; i < kSubscribers; ++i) {
         subscribers.push_back(std::make_unique<Subscriber>(dispatcher));
         const int subIdx = i;
-        subscribers.back()->subscribe(topic, [&receivedCounts, subIdx](const Message&) {
+        subscribers.back()->subscribe(topic, [&receivedCounts, subIdx](const BrokerMessage&) {
             receivedCounts[static_cast<std::size_t>(subIdx)].fetch_add(
                 1, std::memory_order_relaxed);
         });
@@ -317,7 +414,7 @@ TEST(FanoutBackpressure, DropOldest_DropsOldestWhenFull) {
     std::mutex receivedMtx;
 
     Subscriber sub(dispatcher);
-    sub.subscribe(topic, [&](const Message& m) {
+    sub.subscribe(topic, [&](const BrokerMessage& m) {
         const int invocation = handlerInvocations.fetch_add(1);
         if (invocation == 0) {
             while (processingPaused.load(std::memory_order_acquire)) {
@@ -371,7 +468,7 @@ TEST(FanoutBackpressure, RejectNew_RejectsWhenFull) {
     std::mutex receivedMtx;
 
     Subscriber sub(dispatcher);
-    sub.subscribe(topic, [&](const Message& m) {
+    sub.subscribe(topic, [&](const BrokerMessage& m) {
         const int invocation = handlerInvocations.fetch_add(1);
         if (invocation == 0) {
             while (processingPaused.load(std::memory_order_acquire)) {
@@ -426,7 +523,7 @@ TEST(FanoutBackpressure, Block_WaitsUntilSpace) {
     std::mutex receivedMtx;
 
     Subscriber sub(dispatcher);
-    sub.subscribe(topic, [&](const Message& m) {
+    sub.subscribe(topic, [&](const BrokerMessage& m) {
         const int invocation = handlerInvocations.fetch_add(1);
         if (invocation == 0) {
             while (processingPaused.load(std::memory_order_acquire)) {
