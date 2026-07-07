@@ -2,195 +2,146 @@
 #define MESSAGE_QUEUE_H
 #pragma once
 
-#include <string>
-#include <map>
 #include <list>
 #include <vector>
 #include <mutex>
 #include <condition_variable>
-#include <algorithm>
-#include <cstring>
 #include <chrono>
-#include <atomic>
+#include <stdexcept>
+#include <memory>
+#include <functional>
+#include <iostream>
 
 class Message {
 public:
     Message(int id = 0): id(id), size(0) {}
+    Message(const uint8_t* data, size_t len, int id = 0): id(id), payload(data, data + len), size(len) {}
     int getId() const { return id; }
-    void setPayload(const char* data, size_t len){
-        size = (len < sizeof(payload)) ? len : sizeof(payload);
-        memcpy(payload, data, size);
+    void setPayload(const uint8_t* data, size_t len){
+        payload.assign(data, data + len);
+        size = len;
     }
-    const char* getPayload() const { return payload; }
+    const uint8_t* getPayload() const { return payload.data(); }
     size_t getSize() const { return size; }
 
 private:
     int id;
-    char payload[4096];
+    std::vector<uint8_t> payload;
     size_t size;
+};
+
+class BrokerMessage {
+public:
+    BrokerMessage(uint64_t sequence, std::shared_ptr<const Message> message)
+        : sequence_(sequence), message_(std::move(message)) {}
+    uint64_t getSequence() const { return sequence_; }
+    const Message& payload() const { return *message_; }
+private:
+    uint64_t sequence_;
+    std::shared_ptr<const Message> message_;
+};
+
+enum class BackpressurePolicy {
+    Block,
+    DropOldest,
+    RejectNew
+};
+
+class MessageQueue;
+
+class MessageQueueConfig {
+public:
+    BackpressurePolicy backpressurePolicy = BackpressurePolicy::DropOldest;
+    size_t maxSize = 10000;
+};
+
+class BackPressureStrategy {
+public:
+    virtual bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) = 0;
+    virtual std::shared_ptr<const BrokerMessage> try_dequeue(MessageQueue& mq) = 0;
+    virtual bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) = 0;
+    virtual bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) = 0;
+    virtual ~BackPressureStrategy() = default;
+};
+
+class BlockBackPressureStrategy : public BackPressureStrategy {
+public:
+    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) override;
+    std::shared_ptr<const BrokerMessage> try_dequeue(MessageQueue& mq) override;
+    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) override;
+    bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) override;
+};
+
+class DropOldestBackPressureStrategy : public BackPressureStrategy {
+public:
+    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) override;
+    std::shared_ptr<const BrokerMessage> try_dequeue(MessageQueue& mq) override;
+    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) override;
+    bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) override;
+};
+
+class RejectNewBackPressureStrategy : public BackPressureStrategy {
+public:
+    bool try_enqueue(MessageQueue& mq, const std::shared_ptr<const BrokerMessage>& msg) override;
+    std::shared_ptr<const BrokerMessage> try_dequeue(MessageQueue& mq) override;
+    bool try_dequeueFor(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout) override;
+    bool try_dequeueUntil(MessageQueue& mq, std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate) override;
 };
 
 class MessageQueue {
 public:
-    void enqueue(const Message& msg){
-        std::unique_lock<std::mutex> lock(mtx);
-        queue.push_back(msg);
-        cv.notify_one();
-    }
-    Message dequeue(){
-        std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [this]{ return !queue.empty(); });
-        Message m = queue.front();
-        queue.pop_front();
-        return m;
-    }
-    bool dequeueFor(Message& out, std::chrono::milliseconds timeout){
-        std::unique_lock<std::mutex> lock(mtx);
-        if (!cv.wait_for(lock, timeout, [this]{ return !queue.empty(); })) {
-            return false;
+    friend class BlockBackPressureStrategy;
+    friend class DropOldestBackPressureStrategy;
+    friend class RejectNewBackPressureStrategy;
+
+    MessageQueue(const MessageQueueConfig& config = MessageQueueConfig()) : config(config) 
+    {
+        switch(config.backpressurePolicy) {
+            case BackpressurePolicy::Block:
+                strategy_ = std::make_unique<BlockBackPressureStrategy>();
+                break;
+            case BackpressurePolicy::DropOldest:
+                strategy_ = std::make_unique<DropOldestBackPressureStrategy>();
+                break;
+            case BackpressurePolicy::RejectNew:
+                strategy_ = std::make_unique<RejectNewBackPressureStrategy>();
+                break;
+            default:
+                throw std::logic_error("Invalid backpressure policy");
         }
-        out = queue.front();
-        queue.pop_front();
-        return true;
+    }
+    bool enqueue(std::shared_ptr<const BrokerMessage> msg){
+        return strategy_->try_enqueue(*this, msg);
+    }
+    std::shared_ptr<const BrokerMessage> dequeue(){
+        return strategy_->try_dequeue(*this);
+    }
+    bool dequeueFor(std::shared_ptr<const BrokerMessage>& out, const std::chrono::milliseconds& timeout){
+        return strategy_->try_dequeueFor(*this, out, timeout);
+    }
+    bool dequeueUntil(std::shared_ptr<const BrokerMessage>& out, const std::function<bool()>& predicate){
+        return strategy_->try_dequeueUntil(*this, out, predicate);
+    }
+    bool isClosed() const {
+        return closed_;
+    }
+    void close(){
+        std::unique_lock<std::mutex> lock(mtx);
+        closed_ = true;
+        not_empty_cv.notify_all();
+        not_full_cv.notify_all();
+    }
+    void wakeConsumers(){
+        not_empty_cv.notify_all();
     }
 private:
-    std::list<Message> queue;
+    std::list<std::shared_ptr<const BrokerMessage>> queue;
+    MessageQueueConfig config;
     std::mutex mtx;
-    std::condition_variable cv;
+    std::condition_variable not_empty_cv;
+    std::condition_variable not_full_cv;
+    std::unique_ptr<BackPressureStrategy> strategy_;
+    bool closed_ = false;
 };
-
-struct SubscriptionToken {
-    std::string topic;
-    uint64_t id;
-    MessageQueue* mq;
-    enum class Type {
-        Compete,
-        Fanout
-    };
-    Type type;
-
-    SubscriptionToken()
-        : topic(), id(0), mq(nullptr), type(Type::Compete) {}
-
-    SubscriptionToken(std::string topic, uint64_t id, Type type, MessageQueue* mq)
-        : topic(std::move(topic)), id(id), mq(mq), type(type) {}
-
-    bool valid() const { return mq != nullptr; }
-};
-
-class MessageBroker {
-public:
-    void fanoutPublish(const std::string& topic, const Message& msg) {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        auto it = fanoutQueues.find(topic);
-        if (it != fanoutQueues.end()) {
-            for (auto& q : it->second) {
-                q.enqueue(msg);
-            }
-        }
-        else{
-            // topic not found in fanoutQueues. Create it. Message will be lost since no subscribers yet, but that's acceptable in a pub-sub system.
-            fanoutQueues[topic] = std::list<MessageQueue>();
-        }
-    }
-
-    SubscriptionToken fanoutSubscribe(const std::string& topic) {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        auto it = fanoutQueues.find(topic);
-        if (it == fanoutQueues.end()) {
-            // topic not found in fanoutQueues. Create it.
-            fanoutQueues[topic] = std::list<MessageQueue>();
-        }
-        fanoutQueues[topic].emplace_back();
-        auto& mq = fanoutQueues[topic].back();
-        //insert the std::list<MessageQueue>::iterator of the last element into the map
-        const uint64_t id = fanoutSubscriptionId.fetch_add(1);
-        fanoutSubscriptions[id] = std::prev(fanoutQueues[topic].end());
-        return SubscriptionToken(topic, id, SubscriptionToken::Type::Fanout, &mq);
-    }
-
-    void competePublish(const std::string& topic, const Message& msg) {
-        std::unique_lock<std::mutex> lock(sq_mtx);
-        auto it = sharedQueues.find(topic); 
-        if (it != sharedQueues.end()) {
-            it->second.enqueue(msg);
-        }
-        else{
-            // topic not found in sharedQueues. Create a new topic and insert a message queue.
-            // Message will not be lost since it is enqueued.
-            sharedQueues[topic].enqueue(msg);
-        }
-    }
-
-    SubscriptionToken competeSubscribe(const std::string& topic) {
-        std::unique_lock<std::mutex> lock(sq_mtx);
-        auto it = sharedQueues.find(topic);
-        if (it == sharedQueues.end()) {
-            // topic not found in sharedQueues. Create a new topic and add insert a message queue.
-            sharedQueues.try_emplace(topic);
-        }
-        auto& mq = sharedQueues[topic];
-        
-        const uint64_t id = competeSubscriptionId.fetch_add(1);
-        return SubscriptionToken(topic, id, SubscriptionToken::Type::Compete, &mq);
-    }
-
-    void competeUnsubscribe(const SubscriptionToken& token) {
-        // nothing to do here as the message queue is shared between all subscribers.
-    }
-
-    void fanoutUnsubscribe(const SubscriptionToken& token) {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        auto topicIt = fanoutQueues.find(token.topic);
-        if (topicIt == fanoutQueues.end()) {
-            return;
-        }
-        auto subIt = fanoutSubscriptions.find(token.id);
-        if (subIt == fanoutSubscriptions.end()) {
-            return;
-        }
-        topicIt->second.erase(subIt->second);
-        fanoutSubscriptions.erase(subIt);
-        if (topicIt->second.empty()) {
-            fanoutQueues.erase(topicIt);
-        }
-    }
-
-    // Test / observability: number of fan-out subscriber queues for a topic.
-    std::size_t fanoutSubscriberCount(const std::string& topic) {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        auto it = fanoutQueues.find(topic);
-        if (it == fanoutQueues.end()) {
-            return 0;
-        }
-        return it->second.size();
-    }
-
-    std::size_t fanoutSubscriptionCount() {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        return fanoutSubscriptions.size();
-    }
-
-    std::size_t fanoutTotalQueueCount() {
-        std::unique_lock<std::mutex> lock(fo_mtx);
-        std::size_t total = 0;
-        for (const auto& entry : fanoutQueues) {
-            total += entry.second.size();
-        }
-        return total;
-    }
-
-private:
-    std::map<std::string, MessageQueue> sharedQueues;
-    std::map<std::string, std::list<MessageQueue>> fanoutQueues; // for fanout topic
-    std::map<uint64_t, std::list<MessageQueue>::iterator> fanoutSubscriptions;
-    std::mutex sq_mtx;
-    std::mutex fo_mtx;
-    std::atomic<uint64_t> fanoutSubscriptionId;
-    std::atomic<uint64_t> competeSubscriptionId;
-};
-
-// Optional convenience accessor; prefer injecting MessageBroker& from the composition root.
-MessageBroker& getGlobalMessageBroker();
 
 #endif

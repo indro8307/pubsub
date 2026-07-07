@@ -9,6 +9,7 @@ set(PUBSUB_SOURCES
     publisher.cpp
     subscriber.cpp
     message_queue.cpp
+    message_broker.cpp
 )
 
 add_executable(pubsub main.cpp ${PUBSUB_SOURCES})
@@ -25,11 +26,19 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
+include(GoogleTest)
 enable_testing()
 
-add_executable(pubsub_tests tests/pubsub_tests.cpp ${PUBSUB_SOURCES})
-target_include_directories(pubsub_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(pubsub_tests PRIVATE GTest::gtest_main Threads::Threads)
+set(PUBSUB_TEST_SUITES
+    message_broker_tests
+    compete_tests
+    fanout_tests
+    subscriber_lifecycle_tests
+)
 
-include(GoogleTest)
-gtest_discover_tests(pubsub_tests)
+foreach(test_suite IN LISTS PUBSUB_TEST_SUITES)
+    add_executable(${test_suite} tests/${test_suite}.cpp ${PUBSUB_SOURCES})
+    target_include_directories(${test_suite} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(${test_suite} PRIVATE GTest::gtest_main Threads::Threads)
+    gtest_discover_tests(${test_suite})
+endforeach()

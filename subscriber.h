@@ -1,7 +1,7 @@
 #ifndef SUBSCRIBER_H
 #define SUBSCRIBER_H
 
-#include "message_queue.h"
+#include "message_broker.h"
 #include "dispatcher.h"
 #include <string>
 #include <functional>
@@ -13,7 +13,7 @@ enum class SubscriberState { idle, subscribed, stopped };
 
 class Subscriber {
 public:
-	using Handler = std::function<void(const Message&)>;
+	using Handler = std::function<void(const BrokerMessage&)>;
 	Subscriber(Dispatcher& dispatcher);
 	void subscribe(const std::string& topic, Handler handler);
 	void stop();

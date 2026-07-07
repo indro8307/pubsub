@@ -2,7 +2,7 @@
 #include <memory>
 #include <thread>
 #include <chrono>
-#include "message_queue.h"
+#include "message_broker.h"
 #include "publisher.h"
 #include "subscriber.h"
 
@@ -22,17 +22,21 @@ int main(){
     Subscriber sub1(*competeDispatcher1);
     Subscriber sub2(*competeDispatcher1);
 
-    sub1.subscribe("orders", [](const Message& m){
+    sub1.subscribe("orders", [](const BrokerMessage& bm){
+        const Message& m = bm.payload();
         if (m.getId() >= 0) {
-            std::string s(m.getPayload(), m.getSize());
-            std::cout << "[Compete] Subscriber1 received payload=" << s << std::endl;
+            std::string s(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
+            std::cout << "[Compete] Subscriber1 received seq=" << bm.getSequence()
+                      << " payload=" << s << std::endl;
         }
     });
 
-    sub2.subscribe("orders", [](const Message& m){
+    sub2.subscribe("orders", [](const BrokerMessage& bm){
+        const Message& m = bm.payload();
         if (m.getId() >= 0) {
-            std::string s(m.getPayload(), m.getSize());
-            std::cout << "[Compete] Subscriber2 received payload=" << s << std::endl;
+            std::string s(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
+            std::cout << "[Compete] Subscriber2 received seq=" << bm.getSequence()
+                      << " payload=" << s << std::endl;
         }
     });
 
@@ -74,17 +78,21 @@ int main(){
     Subscriber sub3(*fanoutDispatcher1);
     Subscriber sub4(*fanoutDispatcher1);
 
-    sub3.subscribe("notifications", [](const Message& m){
+    sub3.subscribe("notifications", [](const BrokerMessage& bm){
+        const Message& m = bm.payload();
         if (m.getId() >= 0) {
-            std::string s(m.getPayload(), m.getSize());
-            std::cout << "[FanOut] Subscriber3 received payload=" << s << std::endl;
+            std::string s(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
+            std::cout << "[FanOut] Subscriber3 received seq=" << bm.getSequence()
+                      << " payload=" << s << std::endl;
         }
     });
 
-    sub4.subscribe("notifications", [](const Message& m){
+    sub4.subscribe("notifications", [](const BrokerMessage& bm){
+        const Message& m = bm.payload();
         if (m.getId() >= 0) {
-            std::string s(m.getPayload(), m.getSize());
-            std::cout << "[FanOut] Subscriber4 received payload=" << s << std::endl;
+            std::string s(reinterpret_cast<const char*>(m.getPayload()), m.getSize());
+            std::cout << "[FanOut] Subscriber4 received seq=" << bm.getSequence()
+                      << " payload=" << s << std::endl;
         }
     });
 
