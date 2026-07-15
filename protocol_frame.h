@@ -1,6 +1,7 @@
 #ifndef PROTOCOL_FRAME_H
 #define PROTOCOL_FRAME_H
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -27,6 +28,7 @@ enum class PublishResult : uint8_t {
 constexpr uint8_t PROTOCOL_VERSION = 1;
 constexpr uint32_t PROTOCOL_FRAME_MAX_SIZE = 16u * 1024u * 1024u; // 16 MiB
 constexpr uint16_t PROTOCOL_MAX_STRING_LEN = 65535;              // u16 length prefix
+
 
 // Fixed part of an on-wire frame after the u32 frame_len prefix (§2).
 struct FrameHeader {
@@ -84,5 +86,15 @@ struct DeliverMessage {
 struct CloseAck {
     uint32_t request_id = 0;
 };
+
+// Big-endian integer helpers (docs/protocol.md §1). Encode appends to |buffer|;
+// decode reads from |buffer| at |offset| and advances |offset|.
+void encode_u16(uint16_t value, std::vector<uint8_t>& buffer);
+void encode_u32(uint32_t value, std::vector<uint8_t>& buffer);
+void encode_u64(uint64_t value, std::vector<uint8_t>& buffer);
+
+uint16_t decode_u16(const std::vector<uint8_t>& buffer, size_t offset);
+uint32_t decode_u32(const std::vector<uint8_t>& buffer, size_t offset);
+uint64_t decode_u64(const std::vector<uint8_t>& buffer, size_t offset);
 
 #endif
