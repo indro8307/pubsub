@@ -11,6 +11,7 @@ set(PUBSUB_SOURCES
     message_queue.cpp
     message_broker.cpp
     protocol_frame.cpp
+    session.cpp
 )
 
 add_executable(pubsub main.cpp ${PUBSUB_SOURCES})
