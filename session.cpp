@@ -142,6 +142,10 @@ void Session::handleFrame(const FrameHeader& header, std::vector<uint8_t>& frame
 }
 
 void Session::handleSubscribe(std::vector<uint8_t>& frame) {
+    // decode the frame.
+    // call subscribe on the broker with the decoded topic and group.
+    // add the subscription to the map with the subscription id as the key.
+    // encode and send a subscribe ack with the request id and subscription id.
     SubscribeRequest request;
     decode_subscribe_request(request, frame);
 
@@ -161,6 +165,10 @@ void Session::handleSubscribe(std::vector<uint8_t>& frame) {
 }
 
 void Session::handleUnsubscribe(std::vector<uint8_t>& frame) {
+    // decode the frame.
+    // Find the subscription from map using the decoded subscription id.
+    // If a valid subscription is found, unsubscribe from the broker and delete the subscription from the map.
+    // Encode and send an unsubscribe ack with the subscription id.
     UnsubscribeRequest request;
     decode_unsubscribe_request(request, frame);
 
@@ -187,6 +195,10 @@ void Session::handleUnsubscribe(std::vector<uint8_t>& frame) {
 }
 
 void Session::handlePublish(std::vector<uint8_t>& frame) {
+    // decode the frame
+    // find the subscription from map using the decoded subscription id.
+    // call publish on the broker with the decoded topic and group.
+    // encode and send a publish ack with the request id and result.
     PublishRequest request;
     decode_publish_request(request, frame);
 
@@ -206,6 +218,10 @@ void Session::handlePublish(std::vector<uint8_t>& frame) {
 }
 
 void Session::handleClose(std::vector<uint8_t>& frame) {
+    // decode the frame
+    // cleanup the subscriptions
+    // encode and send a close ack with the request id.
+    // set the running flag to false.
     CloseRequest request;
     decode_close_request(request, frame);
 
@@ -222,6 +238,9 @@ void Session::handleClose(std::vector<uint8_t>& frame) {
 }
 
 void Session::cleanupSubscriptions() {
+    // Move subscriptions out under the lock, then unsubscribe outside it.
+    // swap is O(1) and leaves subscriptions_ empty so we don't hold
+    // subs_mtx_ across broker_.unsubscribe() (which takes its own locks).
     std::map<uint64_t, SubscriptionToken> to_remove;
     {
         std::lock_guard<std::mutex> lock(subs_mtx_);
@@ -242,7 +261,7 @@ void Session::sendFrame(ProtocolFrameType type, const std::vector<uint8_t>& body
 
     std::vector<uint8_t> frame;
     encode_frame_header(header, frame);
-    frame.insert(frame.end(), body.begin(), body.end());
+    frame.insert(frame.end(), body.begin(), body.end());   // copy 1 
 
     if (frame.size() > PROTOCOL_FRAME_MAX_SIZE) {
         throw std::runtime_error("Outbound frame exceeds PROTOCOL_FRAME_MAX_SIZE");
@@ -250,7 +269,7 @@ void Session::sendFrame(ProtocolFrameType type, const std::vector<uint8_t>& body
 
     std::vector<uint8_t> wire;
     encode_u32(static_cast<uint32_t>(frame.size()), wire);
-    wire.insert(wire.end(), frame.begin(), frame.end());
+    wire.insert(wire.end(), frame.begin(), frame.end());   // copy 2 copy from frame to wire.
 
     std::lock_guard<std::mutex> lock(write_mtx_);
     if (client_fd_ < 0) {
