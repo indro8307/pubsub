@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <functional>
 
 struct RequestResult {
     ProtocolFrameType type = ProtocolFrameType::SUBSCRIBE_ACK;
@@ -24,7 +25,7 @@ struct RequestResult {
 
 class BrokerClient {
 public:
-    BrokerClient(const std::string& host, int port);
+    BrokerClient(const std::string& host, int port, std::function<void(const DeliverMessage& message)> deliver_message_handler = nullptr);
     ~BrokerClient();
 
     BrokerClient(const BrokerClient&) = delete;
@@ -59,6 +60,8 @@ private:
     std::thread connect_thread_;
     std::mutex request_promises_mutex_;
     std::map<uint32_t, std::promise<std::shared_ptr<RequestResult>>> request_promises_;
+    // hook to handle DELIVER MESSAGE frame
+    std::function<void(const DeliverMessage& message)> deliver_message_handler_;
 };
 
 #endif

@@ -9,13 +9,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-BrokerClient::BrokerClient(const std::string& host, int port)
+BrokerClient::BrokerClient(const std::string& host, int port, std::function<void(const DeliverMessage& message)> deliver_message_handler)
     : socket_fd_(-1),
       host_(host),
       port_(port),
       request_id_counter_(0),
       connected_(false),
-      running_(false) {}
+      running_(false),
+      deliver_message_handler_(std::move(deliver_message_handler)) {}
 
 BrokerClient::~BrokerClient() {
     stop();
@@ -226,8 +227,14 @@ void BrokerClient::receive() {
         case ProtocolFrameType::DELIVER: {
             DeliverMessage deliver;
             decode_deliver_message(deliver, frame_data);
-            // TODO: hand off to NetworkDispatcher / FrameHandler.
-            (void)deliver;
+            // hand off to deliver_message_handler_ if set
+            if (deliver_message_handler_) {
+                try {
+                    deliver_message_handler_(deliver);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error in deliver_message_handler_: " << e.what() << std::endl;
+                }
+            }
             break;
         }
         default:
