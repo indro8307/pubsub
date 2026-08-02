@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <exception>
+#include <iostream>
 #include <netinet/in.h>
 #include <stdexcept>
 #include <sys/socket.h>
@@ -20,6 +21,14 @@ BrokerClient::BrokerClient(const std::string& host, int port, std::function<void
 
 BrokerClient::~BrokerClient() {
     stop();
+}
+
+void BrokerClient::setSubscribeAckHandler(std::function<void(const SubscribeAck&)> handler) {
+    subscribe_ack_handler_ = std::move(handler);
+}
+
+void BrokerClient::setDeliverMessageHandler(std::function<void(const DeliverMessage&)> handler) {
+    deliver_message_handler_ = std::move(handler);
 }
 
 void BrokerClient::start() {
@@ -191,6 +200,15 @@ void BrokerClient::receive() {
         case ProtocolFrameType::SUBSCRIBE_ACK: {
             SubscribeAck ack;
             decode_subscribe_ack(ack, frame_data);
+            // Register the subscription before waking the waiter so a DELIVER
+            // that follows this ACK on the wire cannot race the map insert.
+            if (subscribe_ack_handler_) {
+                try {
+                    subscribe_ack_handler_(ack);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error in subscribe_ack_handler_: " << e.what() << std::endl;
+                }
+            }
             auto result = std::make_shared<RequestResult>();
             result->type = ProtocolFrameType::SUBSCRIBE_ACK;
             result->subscribe_ack = ack;

@@ -40,6 +40,15 @@ public:
     uint32_t generateRequestId();
     bool isConnected() const;
 
+    // hook to handle DELIVER_MESSAGE frame
+    void setDeliverMessageHandler(std::function<void(const DeliverMessage& message)> handler);
+
+    // hook to handle SUBSCRIBE_ACK frame
+    // Invoked on the receive thread when SUBSCRIBE_ACK arrives, before the
+    // matching sendFrame() promise is fulfilled. Lets the dispatcher publish
+    // subscription_id → queue before any subsequent DELIVER is handled.
+    void setSubscribeAckHandler(std::function<void(const SubscribeAck&)> handler);
+
 private:
     ssize_t recvExact(int fd, void* buffer, size_t count);
     ssize_t sendExact(int fd, const void* buffer, size_t count);
@@ -62,6 +71,7 @@ private:
     std::map<uint32_t, std::promise<std::shared_ptr<RequestResult>>> request_promises_;
     // hook to handle DELIVER MESSAGE frame
     std::function<void(const DeliverMessage& message)> deliver_message_handler_;
+    std::function<void(const SubscribeAck&)> subscribe_ack_handler_;
 };
 
 #endif
