@@ -50,6 +50,8 @@ public:
     // a blocking recv wakes up; the thread then cleans up and exits.
     void requestStop();
 
+    bool isRunning() const { return running_.load(std::memory_order_acquire); }
+
 private:
     // Reader thread entry: loop on recv frame_len + body until stop/error.
     void run();

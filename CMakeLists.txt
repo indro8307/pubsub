@@ -12,6 +12,7 @@ set(PUBSUB_SOURCES
     message_broker.cpp
     protocol_frame.cpp
     session.cpp
+    broker_server.cpp
     broker_client.cpp
     dispatcher.cpp
 )

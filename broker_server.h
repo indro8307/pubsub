@@ -42,6 +42,7 @@ public:
 
 private:
     void acceptLoop();
+    void handleClientConnection(int client_socket);
 
     // Remove finished sessions from |sessions_| (called from acceptLoop or stop).
     void reapFinishedSessions();
