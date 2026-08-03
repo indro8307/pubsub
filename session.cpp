@@ -141,11 +141,42 @@ void Session::handleFrame(const FrameHeader& header, std::vector<uint8_t>& frame
     }
 }
 
+void Session::deliverMessage(Deliverer* deliverer) {
+    MessageQueue* mq = deliverer->token_.mq.get();
+    while (deliverer->running_.load(std::memory_order_acquire)) {
+        std::shared_ptr<const BrokerMessage> msg;
+        bool gotMessage = mq->dequeueUntil(msg, [deliverer]() {
+            return !deliverer->running_.load(std::memory_order_acquire);
+        });
+        if (!gotMessage) {
+            continue;
+        }
+
+        if (msg) {
+            // encode the message body; sendFrame adds the frame header
+            DeliverMessage deliver_message;
+            deliver_message.subscription_id = deliverer->token_.id;
+            deliver_message.topic = deliverer->token_.topic;
+            deliver_message.sequence = msg->getSequence();
+            const Message& payload = msg->payload();
+            deliver_message.payload.assign(
+                payload.getPayload(), payload.getPayload() + payload.getSize());
+
+            std::vector<uint8_t> body;
+            encode_deliver_message(deliver_message, body);
+            sendFrame(ProtocolFrameType::DELIVER, body);
+        }
+    }
+}
+
 void Session::handleSubscribe(std::vector<uint8_t>& frame) {
     // decode the frame.
     // call subscribe on the broker with the decoded topic and group.
     // add the subscription to the map with the subscription id as the key.
     // encode and send a subscribe ack with the request id and subscription id.
+    // Spawn a thread that will:
+    //       1. dequeue any message from the message queue for the subscription
+    //       2. encode the message as a DELIVER frame and send it to the client    
     SubscribeRequest request;
     decode_subscribe_request(request, frame);
 
@@ -162,6 +193,17 @@ void Session::handleSubscribe(std::vector<uint8_t>& frame) {
     std::vector<uint8_t> body;
     encode_subscribe_ack(ack, body);
     sendFrame(ProtocolFrameType::SUBSCRIBE_ACK, body);
+
+    auto deliverer = std::make_unique<Deliverer>();
+    deliverer->token_ = token;
+    deliverer->running_.store(true, std::memory_order_release);
+    Deliverer* raw = deliverer.get();
+    deliverer->thread_ = std::thread(&Session::deliverMessage, this, raw);
+    {
+        std::lock_guard<std::mutex> lock(deliverers_mtx_);
+        deliverers_[token.id] = std::move(deliverer);
+    }
+
 }
 
 void Session::handleUnsubscribe(std::vector<uint8_t>& frame) {
@@ -182,6 +224,27 @@ void Session::handleUnsubscribe(std::vector<uint8_t>& frame) {
         }
     }
     if (token.valid()) {
+        // cleanup the deliverer first.
+        // find the deliverer from the map using the subscription id.
+        // set the running flag to false, wake, join, then remove from the map.
+        std::unique_ptr<Deliverer> to_stop;
+        {
+            std::lock_guard<std::mutex> lock(deliverers_mtx_);
+            auto it = deliverers_.find(request.subscription_id);
+            if (it != deliverers_.end()) {
+                // good idea to match the SubscriptionToken found earlier with the deliverer in the map.
+                if (it->second->token_.id != token.id) {
+                    throw std::runtime_error("SubscriptionToken mismatch in deliverer map");
+                }
+                it->second->running_.store(false, std::memory_order_release);
+                it->second->token_.mq->wakeConsumers();
+                to_stop = std::move(it->second);
+                deliverers_.erase(it);
+            }
+        }
+        if (to_stop && to_stop->thread_.joinable()) {
+            to_stop->thread_.join();
+        }
         broker_.unsubscribe(token);
     }
 
@@ -238,6 +301,29 @@ void Session::handleClose(std::vector<uint8_t>& frame) {
 }
 
 void Session::cleanupSubscriptions() {
+    // Stop and join deliverers first so threads are not joinable when the map dies.
+    std::map<uint64_t, std::unique_ptr<Deliverer>> deliverers_to_stop;
+    {
+        std::lock_guard<std::mutex> lock(deliverers_mtx_);
+        deliverers_to_stop.swap(deliverers_);
+    }
+    for (auto& [id, deliverer] : deliverers_to_stop) {
+        (void)id;
+        if (!deliverer) {
+            continue;
+        }
+        deliverer->running_.store(false, std::memory_order_release);
+        if (deliverer->token_.mq) {
+            deliverer->token_.mq->wakeConsumers();
+        }
+    }
+    for (auto& [id, deliverer] : deliverers_to_stop) {
+        (void)id;
+        if (deliverer && deliverer->thread_.joinable()) {
+            deliverer->thread_.join();
+        }
+    }
+
     // Move subscriptions out under the lock, then unsubscribe outside it.
     // swap is O(1) and leaves subscriptions_ empty so we don't hold
     // subs_mtx_ across broker_.unsubscribe() (which takes its own locks).

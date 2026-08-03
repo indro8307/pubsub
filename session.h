@@ -7,9 +7,16 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+struct Deliverer {
+    SubscriptionToken token_;
+    std::thread thread_;
+    std::atomic<bool> running_{false};
+};
 
 // One TCP client connection to the broker daemon (docs/protocol.md).
 //
@@ -75,6 +82,11 @@ private:
     // subscription_id (wire) → broker token for this connection.
     std::mutex subs_mtx_;
     std::map<uint64_t, SubscriptionToken> subscriptions_;
+
+    std::map<uint64_t, std::unique_ptr<Deliverer>> deliverers_;
+    std::mutex deliverers_mtx_;
+
+    void deliverMessage(Deliverer* deliverer);
 };
 
 #endif
