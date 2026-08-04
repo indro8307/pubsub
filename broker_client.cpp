@@ -43,10 +43,9 @@ void BrokerClient::start() {
 void BrokerClient::stop() {
     {
         std::lock_guard<std::mutex> lock(socket_fd_mutex_);
-        if (!running_.load(std::memory_order_acquire)) {
-            return;
-        }
         // Always tear down if start() ran, even when connect has not finished yet.
+        // Do not early-return on !running_: the receive thread may have cleared
+        // running_ already; we still must join connect_thread_.
         running_.store(false, std::memory_order_release);
         connected_.store(false, std::memory_order_release);
         if (socket_fd_ != -1) {
@@ -291,7 +290,7 @@ void BrokerClient::run() {
             fd = -1;  // ownership transferred
         }
         connected_.store(true, std::memory_order_release);
-
+        
         while (connected_.load(std::memory_order_acquire) &&
                running_.load(std::memory_order_acquire)) {
             receive();

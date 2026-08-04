@@ -244,3 +244,8 @@ void NetworkDispatcher::on_subscribe_ack(const SubscribeAck& ack) {
     subscription_tokens_[ack.subscription_id] = token;
     pending_by_request_id_.erase(pending_it);
 }
+
+bool NetworkDispatcher::hasSubscription(uint64_t subscription_id) const {
+    std::lock_guard<std::mutex> lock(subscription_tokens_mutex_);
+    return subscription_tokens_.find(subscription_id) != subscription_tokens_.end();
+}

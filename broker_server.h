@@ -40,6 +40,16 @@ public:
 
     bool isRunning() const { return running_.load(std::memory_order_acquire); }
 
+    // True after bind/listen succeed; safe for tests to wait on before connecting.
+    bool isListening() const { return listening_.load(std::memory_order_acquire); }
+
+    // Snapshot of sessions accepted so far (includes sessions that may have ended
+    // if they have not been reaped yet).
+    std::vector<std::shared_ptr<Session>> sessions() const {
+        std::lock_guard<std::mutex> lock(sessions_mtx_);
+        return sessions_;
+    }
+
 private:
     void acceptLoop();
     void handleClientConnection(int client_socket);
@@ -53,8 +63,9 @@ private:
     int listen_fd_ = -1;
     std::thread accept_thread_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> listening_{false};
 
-    std::mutex sessions_mtx_;
+    mutable std::mutex sessions_mtx_;
     std::vector<std::shared_ptr<Session>> sessions_;
 };
 

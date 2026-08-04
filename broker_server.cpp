@@ -23,6 +23,7 @@ void BrokerServer::start() {
 
 void BrokerServer::stop() {
     running_.store(false, std::memory_order_release);
+    listening_.store(false, std::memory_order_release);
     if (listen_fd_ >= 0) {
         // Wake a blocking accept().
         ::shutdown(listen_fd_, SHUT_RDWR);
@@ -74,6 +75,7 @@ void BrokerServer::acceptLoop() {
         if (::listen(server_socket, 10) == -1) {
             throw std::runtime_error("Failed to listen for connections");
         }
+        listening_.store(true, std::memory_order_release);
         // Accept connections
         while (running_.load(std::memory_order_acquire)) {
             sockaddr_in client_addr{};
@@ -91,6 +93,7 @@ void BrokerServer::acceptLoop() {
     } catch (const std::exception& e) {
         std::cerr << "Error in accept loop: " << e.what() << std::endl;
     }
+    listening_.store(false, std::memory_order_release);
     // Close server socket
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);

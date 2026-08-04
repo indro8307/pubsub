@@ -52,6 +52,12 @@ public:
 
     bool isRunning() const { return running_.load(std::memory_order_acquire); }
 
+    // Number of deliverer threads currently tracked for this connection.
+    size_t delivererCount() const {
+        std::lock_guard<std::mutex> lock(deliverers_mtx_);
+        return deliverers_.size();
+    }
+
 private:
     // Reader thread entry: loop on recv frame_len + body until stop/error.
     void run();
@@ -86,7 +92,7 @@ private:
     std::map<uint64_t, SubscriptionToken> subscriptions_;
 
     std::map<uint64_t, std::unique_ptr<Deliverer>> deliverers_;
-    std::mutex deliverers_mtx_;
+    mutable std::mutex deliverers_mtx_;
 
     void deliverMessage(Deliverer* deliverer);
 };

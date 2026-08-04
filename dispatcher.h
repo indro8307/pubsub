@@ -55,6 +55,9 @@ public:
     SubscriptionToken subscribe(const std::string& topic) override;
     void unsubscribe(const SubscriptionToken& token) override;
 
+    // True after SubscribeAck was applied via on_subscribe_ack for this id.
+    bool hasSubscription(uint64_t subscription_id) const;
+
 private:
     void on_subscribe_ack(const SubscribeAck& ack);
 
@@ -62,7 +65,7 @@ private:
     std::atomic<uint64_t> next_subscription_id_{1};
     std::map<uint64_t, SubscriptionToken> subscription_tokens_;
     std::map<uint32_t, SubscriptionToken> pending_by_request_id_;
-    std::mutex subscription_tokens_mutex_;
+    mutable std::mutex subscription_tokens_mutex_;
 };
 
 #endif

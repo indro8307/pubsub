@@ -40,6 +40,7 @@ set(PUBSUB_TEST_SUITES
     fanout_tests
     subscriber_lifecycle_tests
     protocol_frame_tests
+    network_tests
 )
 
 foreach(test_suite IN LISTS PUBSUB_TEST_SUITES)
