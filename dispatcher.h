@@ -62,7 +62,6 @@ private:
     void on_subscribe_ack(const SubscribeAck& ack);
 
     BrokerClient broker_client_;
-    std::atomic<uint64_t> next_subscription_id_{1};
     std::map<uint64_t, SubscriptionToken> subscription_tokens_;
     std::map<uint32_t, SubscriptionToken> pending_by_request_id_;
     mutable std::mutex subscription_tokens_mutex_;

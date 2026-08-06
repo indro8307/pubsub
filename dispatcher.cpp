@@ -4,7 +4,22 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
+
+#include <uuid/uuid.h>
+
+namespace {
+
+std::string randomUuidV4() {
+    uuid_t id;
+    uuid_generate_random(id);
+    char str[UUID_STR_LEN];
+    uuid_unparse_lower(id, str);
+    return std::string(str);
+}
+
+}  // namespace
 
 CompeteConsumerDispatcher::CompeteConsumerDispatcher(MessageBroker& broker) : bro(broker) {}
 
@@ -140,11 +155,9 @@ SubscriptionToken NetworkDispatcher::subscribe(const std::string& topic) {
     SubscribeRequest subscribe_request;
     subscribe_request.request_id = broker_client_.generateRequestId();
     subscribe_request.topic = topic;
-    // for fanout subscribe generate a unique group name for each subscriber.
-    uint64_t local_subscriberId = next_subscription_id_.fetch_add(1);
-    // NOTE: This subscriber id is diffrent from the subscription id.
-    // This subscriber id is used to form the unique group name for each subscriber for fanout subscribe.
-    subscribe_request.group = topic + "_sub_" + std::to_string(local_subscriberId);
+    // Fan-out: unique group per subscriber (UUID so uniqueness holds across
+    // processes and hosts). Distinct from the broker-assigned subscription_id.
+    subscribe_request.group = topic + "_sub_" + randomUuidV4();
     encode_subscribe_request(subscribe_request, frame_buffer);
 
     // Pre-create the queue and register as pending by request_id so the
