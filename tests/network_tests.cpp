@@ -8,6 +8,7 @@
 #include "test_helpers.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -125,6 +126,22 @@ bool waitForSessionCount(BrokerServer& server, size_t n) {
         2s);
 }
 
+size_t runningSessionCount(BrokerServer& server) {
+    size_t n = 0;
+    for (const auto& session : server.sessions()) {
+        if (session && session->isRunning()) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+bool waitForRunningSessionCount(BrokerServer& server, size_t n) {
+    return waitUntil(
+        [&] { return runningSessionCount(server) == n; },
+        2s);
+}
+
 std::string payloadOf(const BrokerMessage& msg) {
     return std::string(reinterpret_cast<const char*>(msg.payload().getPayload()),
                        msg.payload().getSize());
@@ -148,6 +165,45 @@ std::vector<uint8_t> encodeCloseFrame(uint32_t request_id) {
     CloseRequest request{request_id};
     encode_close_request(request, buffer);
     return buffer;
+}
+
+int connectRawTcp(const char* host, uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = ::inet_addr(host);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+bool writeAll(int fd, const void* data, size_t n) {
+    auto* p = static_cast<const uint8_t*>(data);
+    size_t sent = 0;
+    while (sent < n) {
+        const ssize_t nwritten = ::write(fd, p + sent, n - sent);
+        if (nwritten < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        sent += static_cast<size_t>(nwritten);
+    }
+    return true;
+}
+
+bool sendRawFrame(int fd, const std::vector<uint8_t>& frame) {
+    std::vector<uint8_t> wire;
+    encode_u32(static_cast<uint32_t>(frame.size()), wire);
+    wire.insert(wire.end(), frame.begin(), frame.end());
+    return writeAll(fd, wire.data(), wire.size());
 }
 
 }  // namespace
@@ -671,3 +727,283 @@ TEST(NetworkTests, ImmediatePublishAfterSubscribeDoesNotDropFirstDeliver) {
     subscriber.unsubscribe(token);
     server.stop();
 }
+
+// F1 — MalformedFrameDropsSessionOnly
+//
+// Purpose: A single bad length-prefixed frame must end that Session only. The
+// accept loop stays healthy so a later well-behaved client can still connect.
+//
+// Action: raw TCP client sends frame_len == 1 (< minimum header size of 2).
+// Session::run breaks out of the reader loop, cleans up, and sets !isRunning().
+//
+TEST(NetworkTests, MalformedFrameDropsSessionOnly) {
+    const uint16_t port = testPort();
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    const int bad_fd = connectRawTcp(kHost, port);
+    ASSERT_GE(bad_fd, 0);
+    ASSERT_TRUE(waitForOneRunningSession(server));
+    auto bad_session = server.sessions()[0];
+
+    // frame_len = 1 → rejected by Session::run (needs at least 2-byte header).
+    std::vector<uint8_t> bad_len;
+    encode_u32(1u, bad_len);
+    ASSERT_TRUE(writeAll(bad_fd, bad_len.data(), bad_len.size()));
+
+    ASSERT_TRUE(waitUntil(
+        [&] { return bad_session && !bad_session->isRunning(); }, 2s))
+        << "Malformed frame did not end the session";
+    EXPECT_TRUE(server.isListening());
+    ::close(bad_fd);
+
+    BrokerClient good(kHost, static_cast<int>(port));
+    good.start();
+    ASSERT_TRUE(waitUntil([&] { return good.isConnected(); }, 2s));
+    ASSERT_TRUE(waitForRunningSessionCount(server, 1))
+        << "Server accept loop unhealthy after malformed-frame session";
+
+    good.stop();
+    server.stop();
+}
+
+// F2 — UnsupportedProtocolVersionDropsSession
+//
+// Purpose: A length-valid frame whose FrameHeader.version != PROTOCOL_VERSION
+// must drop that session the same way as F1, without killing the server.
+//
+TEST(NetworkTests, UnsupportedProtocolVersionDropsSession) {
+    const uint16_t port = testPort();
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    const int bad_fd = connectRawTcp(kHost, port);
+    ASSERT_GE(bad_fd, 0);
+    ASSERT_TRUE(waitForOneRunningSession(server));
+    auto bad_session = server.sessions()[0];
+
+    std::vector<uint8_t> frame;
+    FrameHeader header{static_cast<uint8_t>(PROTOCOL_VERSION + 1),
+                       ProtocolFrameType::SUBSCRIBE};
+    encode_frame_header(header, frame);
+    ASSERT_TRUE(sendRawFrame(bad_fd, frame));
+
+    ASSERT_TRUE(waitUntil(
+        [&] { return bad_session && !bad_session->isRunning(); }, 2s))
+        << "Unsupported protocol version did not end the session";
+    EXPECT_TRUE(server.isListening());
+    ::close(bad_fd);
+
+    BrokerClient good(kHost, static_cast<int>(port));
+    good.start();
+    ASSERT_TRUE(waitUntil([&] { return good.isConnected(); }, 2s));
+    ASSERT_TRUE(waitForRunningSessionCount(server, 1));
+
+    good.stop();
+    server.stop();
+}
+
+// F5 — ManySubscriptionsPerSession
+//
+// Purpose: One NetworkDispatcher / Session can hold multiple subscriptions
+// (each with its own deliverer). Unsubscribing one must not tear down the
+// others' deliverers or broker registrations.
+//
+TEST(NetworkTests, ManySubscriptionsPerSession) {
+    const uint16_t port = testPort();
+    const char* topic_a = "orders_a";
+    const char* topic_b = "orders_b";
+    const char* topic_c = "orders_c";
+    const std::string payload_a = "keep-a";
+    const std::string payload_c = "keep-c";
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    NetworkDispatcher subscriber(kHost, static_cast<int>(port));
+    ASSERT_TRUE(waitForOneRunningSession(server));
+    auto session = server.sessions()[0];
+
+    SubscriptionToken token_a = subscriber.subscribe(topic_a);
+    SubscriptionToken token_b = subscriber.subscribe(topic_b);
+    SubscriptionToken token_c = subscriber.subscribe(topic_c);
+    ASSERT_TRUE(token_a.valid());
+    ASSERT_TRUE(token_b.valid());
+    ASSERT_TRUE(token_c.valid());
+    ASSERT_NE(token_a.id, token_b.id);
+    ASSERT_NE(token_b.id, token_c.id);
+
+    ASSERT_TRUE(waitUntil(
+        [&] {
+            return broker.subscriptionCount() == 3 && session->delivererCount() == 3;
+        },
+        2s));
+    EXPECT_TRUE(subscriber.hasSubscription(token_a.id));
+    EXPECT_TRUE(subscriber.hasSubscription(token_b.id));
+    EXPECT_TRUE(subscriber.hasSubscription(token_c.id));
+
+    subscriber.unsubscribe(token_b);
+
+    ASSERT_TRUE(waitUntil(
+        [&] {
+            return broker.subscriptionCount() == 2 && session->delivererCount() == 2;
+        },
+        2s))
+        << "Unsubscribe of one sub did not leave the other deliverers";
+    EXPECT_TRUE(subscriber.hasSubscription(token_a.id));
+    EXPECT_FALSE(subscriber.hasSubscription(token_b.id));
+    EXPECT_TRUE(subscriber.hasSubscription(token_c.id));
+
+    NetworkDispatcher publisher(kHost, static_cast<int>(port));
+    ASSERT_TRUE(waitForSessionCount(server, 2));
+    publisher.publish(topic_a, /*id=*/1, payload_a);
+    publisher.publish(topic_c, /*id=*/2, payload_c);
+    publisher.publish(topic_b, /*id=*/3, "should-not-arrive");
+
+    std::shared_ptr<const BrokerMessage> got_a;
+    std::shared_ptr<const BrokerMessage> got_c;
+    ASSERT_TRUE(token_a.mq->dequeueFor(got_a, 2s));
+    ASSERT_TRUE(token_c.mq->dequeueFor(got_c, 2s));
+    EXPECT_EQ(payloadOf(*got_a), payload_a);
+    EXPECT_EQ(payloadOf(*got_c), payload_c);
+
+    std::shared_ptr<const BrokerMessage> stray;
+    EXPECT_FALSE(token_b.mq->dequeueFor(stray, 100ms))
+        << "Unsubscribed queue still received delivers";
+
+    subscriber.unsubscribe(token_a);
+    subscriber.unsubscribe(token_c);
+    server.stop();
+}
+
+// Network stress — 50 NetworkDispatchers shared by 100 fan-out subscribers
+// (2 subscribe()s each) and 50 publisher threads × 100 messages on one topic.
+//
+// Publishes are serialized so every subscriber must see the same broker
+// sequence order (concurrent publish can reorder fan-out enqueues today).
+// Dispatchers are reused for both subscribe and publish (multiplexed sessions).
+//
+TEST(NetworkStress, FiftyDispatchers_HundredSubs_SerializedPublishOrder) {
+    constexpr int kDispatchers = 50;
+    constexpr int kSubsPerDispatcher = 2;
+    constexpr int kSubscribers = kDispatchers * kSubsPerDispatcher;  // 100
+    constexpr int kPublishers = 50;
+    constexpr int kMessagesPerPublisher = 100;
+    constexpr int kTotalMessages = kPublishers * kMessagesPerPublisher;  // 5000
+
+    const uint16_t port = testPort();
+    const std::string topic = "network-stress";
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    std::vector<std::unique_ptr<NetworkDispatcher>> dispatchers;
+    dispatchers.reserve(static_cast<size_t>(kDispatchers));
+    for (int i = 0; i < kDispatchers; ++i) {
+        dispatchers.push_back(
+            std::make_unique<NetworkDispatcher>(kHost, static_cast<int>(port)));
+    }
+    ASSERT_TRUE(waitUntil(
+        [&] { return runningSessionCount(server) == static_cast<size_t>(kDispatchers); },
+        10s))
+        << "Expected " << kDispatchers << " running sessions";
+
+    std::vector<SubscriptionToken> tokens;
+    tokens.reserve(static_cast<size_t>(kSubscribers));
+    for (auto& dispatcher : dispatchers) {
+        for (int s = 0; s < kSubsPerDispatcher; ++s) {
+            SubscriptionToken token = dispatcher->subscribe(topic);
+            ASSERT_TRUE(token.valid()) << "subscribe failed";
+            tokens.push_back(std::move(token));
+        }
+    }
+    ASSERT_EQ(tokens.size(), static_cast<size_t>(kSubscribers));
+    ASSERT_TRUE(waitUntil(
+        [&] {
+            return broker.subscriptionCount() == static_cast<size_t>(kSubscribers) &&
+                   broker.groupCount(topic) == static_cast<size_t>(kSubscribers);
+        },
+        10s));
+
+    std::vector<std::vector<uint64_t>> sequences(static_cast<size_t>(kSubscribers));
+    std::vector<std::thread> consumers;
+    consumers.reserve(static_cast<size_t>(kSubscribers));
+    for (int i = 0; i < kSubscribers; ++i) {
+        consumers.emplace_back([&, i] {
+            auto& seqs = sequences[static_cast<size_t>(i)];
+            seqs.reserve(static_cast<size_t>(kTotalMessages));
+            while (seqs.size() < static_cast<size_t>(kTotalMessages)) {
+                std::shared_ptr<const BrokerMessage> msg;
+                if (!tokens[static_cast<size_t>(i)].mq->dequeueFor(msg, 5s) || !msg) {
+                    return;
+                }
+                seqs.push_back(msg->getSequence());
+            }
+        });
+    }
+
+    // One publish at a time across all publisher threads → identical fan-out order.
+    std::mutex publish_mu;
+    std::atomic<bool> publish_ok{true};
+    std::vector<std::thread> publishers;
+    publishers.reserve(static_cast<size_t>(kPublishers));
+    for (int pubIdx = 0; pubIdx < kPublishers; ++pubIdx) {
+        publishers.emplace_back([&, pubIdx] {
+            NetworkDispatcher& dispatcher =
+                *dispatchers[static_cast<size_t>(pubIdx % kDispatchers)];
+            try {
+                for (int msgIdx = 0; msgIdx < kMessagesPerPublisher; ++msgIdx) {
+                    std::lock_guard<std::mutex> lock(publish_mu);
+                    dispatcher.publish(
+                        topic,
+                        /*id=*/msgIdx,
+                        "p" + std::to_string(pubIdx) + "_" + std::to_string(msgIdx));
+                }
+            } catch (...) {
+                publish_ok.store(false, std::memory_order_release);
+            }
+        });
+    }
+
+    for (auto& t : publishers) {
+        t.join();
+    }
+    ASSERT_TRUE(publish_ok.load(std::memory_order_acquire)) << "Publisher thread failed";
+
+    for (auto& t : consumers) {
+        t.join();
+    }
+
+    for (int i = 0; i < kSubscribers; ++i) {
+        ASSERT_EQ(sequences[static_cast<size_t>(i)].size(),
+                  static_cast<size_t>(kTotalMessages))
+            << "subscriber " << i << " incomplete (dequeue timeout?)";
+    }
+
+    const std::vector<uint64_t>& reference = sequences[0];
+    for (size_t i = 1; i < reference.size(); ++i) {
+        EXPECT_LT(reference[i - 1], reference[i])
+            << "reference sequences not strictly increasing at index " << i;
+    }
+    for (int i = 1; i < kSubscribers; ++i) {
+        EXPECT_EQ(sequences[static_cast<size_t>(i)], reference)
+            << "subscriber " << i << " saw a different order/set than subscriber 0";
+    }
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        dispatchers[i / static_cast<size_t>(kSubsPerDispatcher)]->unsubscribe(tokens[i]);
+    }
+    server.stop();
+}
+
+
