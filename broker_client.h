@@ -54,7 +54,7 @@ private:
     ssize_t sendExact(int fd, const void* buffer, size_t count);
 
     void fulfillPromise(uint32_t request_id, std::shared_ptr<RequestResult> result);
-    void failAllPending(const std::exception& ex);
+    void failAllPending(std::exception_ptr ep);
 
     void receive();
     void run();

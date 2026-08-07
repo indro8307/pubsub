@@ -59,7 +59,7 @@ void BrokerClient::stop() {
         connect_thread_.join();
     }
 
-    failAllPending(std::runtime_error("BrokerClient stopped"));
+    failAllPending(std::make_exception_ptr(std::runtime_error("BrokerClient stopped")));
 }
 
 std::future<std::shared_ptr<RequestResult>> BrokerClient::sendFrame(
@@ -154,7 +154,7 @@ void BrokerClient::fulfillPromise(uint32_t request_id,
     promise.set_value(std::move(result));
 }
 
-void BrokerClient::failAllPending(const std::exception& ex) {
+void BrokerClient::failAllPending(std::exception_ptr ep) {
     std::map<uint32_t, std::promise<std::shared_ptr<RequestResult>>> pending;
     {
         std::lock_guard<std::mutex> lock(request_promises_mutex_);
@@ -163,7 +163,7 @@ void BrokerClient::failAllPending(const std::exception& ex) {
     for (auto& [request_id, promise] : pending) {
         (void)request_id;
         try {
-            promise.set_exception(std::make_exception_ptr(ex));
+            promise.set_exception(ep);
         } catch (const std::future_error&) {
             // Already satisfied.
         }
@@ -308,7 +308,7 @@ void BrokerClient::run() {
         }
         connected_.store(false, std::memory_order_release);
         running_.store(false, std::memory_order_release);
-        failAllPending(std::runtime_error("BrokerClient connection/receive failed"));
+        failAllPending(std::make_exception_ptr(std::runtime_error("BrokerClient connection/receive failed")));
         // Do not rethrow: escaping the thread would call std::terminate.
     }
 
