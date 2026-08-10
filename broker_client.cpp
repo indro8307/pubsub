@@ -50,14 +50,16 @@ void BrokerClient::stop() {
         connected_.store(false, std::memory_order_release);
         if (socket_fd_ != -1) {
             ::shutdown(socket_fd_, SHUT_RDWR);
-            ::close(socket_fd_);
-            socket_fd_ = -1;
         }
     }  // release socket_fd_mutex_ before join to avoid deadlock
 
     if (connect_thread_.joinable()) {
         connect_thread_.join();
     }
+    if (socket_fd_ != -1) {
+        ::close(socket_fd_);
+        socket_fd_ = -1;
+    }    
 
     failAllPending(std::make_exception_ptr(std::runtime_error("BrokerClient stopped")));
 }

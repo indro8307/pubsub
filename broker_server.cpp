@@ -31,6 +31,11 @@ void BrokerServer::stop() {
     if (accept_thread_.joinable()) {
         accept_thread_.join();
     }
+    // Close server socket
+    if (listen_fd_ >= 0) {
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+    }      
     std::vector<std::shared_ptr<Session>> sessions;
     {
         std::lock_guard<std::mutex> lock(sessions_mtx_);
@@ -94,11 +99,6 @@ void BrokerServer::acceptLoop() {
         std::cerr << "Error in accept loop: " << e.what() << std::endl;
     }
     listening_.store(false, std::memory_order_release);
-    // Close server socket
-    if (listen_fd_ >= 0) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-    }
 }
 
 void BrokerServer::handleClientConnection(int client_socket) {

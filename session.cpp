@@ -76,7 +76,7 @@ void Session::requestStop() {
     if (client_fd_ >= 0) {
         // Wake a blocking read; ignore errors if already closed.
         ::shutdown(client_fd_, SHUT_RDWR);
-    }
+    }  
 }
 
 void Session::run() {
@@ -113,11 +113,6 @@ void Session::run() {
 
     cleanupSubscriptions();
     running_.store(false, std::memory_order_release);
-
-    if (client_fd_ >= 0) {
-        ::close(client_fd_);
-        client_fd_ = -1;
-    }
 }
 
 void Session::handleFrame(const FrameHeader& header, std::vector<uint8_t>& frame) {
