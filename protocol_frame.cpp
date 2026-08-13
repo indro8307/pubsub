@@ -121,6 +121,9 @@ void encode_subscribe_ack(SubscribeAck& ack, std::vector<uint8_t>& buffer) {
 // decode a subscribe ack
 void decode_subscribe_ack(SubscribeAck& ack, std::vector<uint8_t>& buffer) {
     size_t offset = kFrameHeaderSize;
+    if (buffer.size() < offset + 4 + 8) {
+        throw std::runtime_error("Invalid subscribe ack size");
+    }
     ack.request_id = decode_u32(buffer, offset);
     offset += 4;
     ack.subscription_id = decode_u64(buffer, offset);
@@ -135,6 +138,9 @@ void encode_unsubscribe_request(UnsubscribeRequest& request, std::vector<uint8_t
 // decode a unsubscribe request
 void decode_unsubscribe_request(UnsubscribeRequest& request, std::vector<uint8_t>& buffer) {
     size_t offset = kFrameHeaderSize;
+    if (buffer.size() < offset + 4 + 8) {
+        throw std::runtime_error("Invalid unsubscribe request size");
+    }
     request.request_id = decode_u32(buffer, offset);
     offset += 4;
     request.subscription_id = decode_u64(buffer, offset);
@@ -152,15 +158,30 @@ void encode_publish_request(PublishRequest& request, std::vector<uint8_t>& buffe
 // decode a publish request
 void decode_publish_request(PublishRequest& request, std::vector<uint8_t>& buffer) {
     size_t offset = kFrameHeaderSize;
+    if (buffer.size() < offset + 4) {
+        throw std::runtime_error("Invalid publish request size");
+    }
     request.request_id = decode_u32(buffer, offset);
     offset += 4;
+    if (buffer.size() < offset + 2) {
+        throw std::runtime_error("Invalid publish request size. Not enough data for topic size");
+    }
     const uint16_t topic_size = decode_u16(buffer, offset);
     offset += 2;
+    if (buffer.size() < offset + topic_size) {
+        throw std::runtime_error("Invalid publish request size. Not enough data for topic");
+    }
     request.topic = std::string(buffer.begin() + static_cast<std::ptrdiff_t>(offset),
                                 buffer.begin() + static_cast<std::ptrdiff_t>(offset + topic_size));
     offset += topic_size;
+    if (buffer.size() < offset + 4) {
+        throw std::runtime_error("Invalid publish request size. Not enough data for payload size");
+    }
     const uint32_t payload_size = decode_u32(buffer, offset);
     offset += 4;
+    if (payload_size > buffer.size() || offset > buffer.size() - payload_size) {
+        throw std::runtime_error("Invalid publish request size. Not enough data for payload");
+    }
     request.payload = std::vector<uint8_t>(
         buffer.begin() + static_cast<std::ptrdiff_t>(offset),
         buffer.begin() + static_cast<std::ptrdiff_t>(offset + payload_size));
@@ -175,6 +196,9 @@ void encode_publish_ack(PublishAck& ack, std::vector<uint8_t>& buffer) {
 // decode a publish ack
 void decode_publish_ack(PublishAck& ack, std::vector<uint8_t>& buffer) {
     size_t offset = kFrameHeaderSize;
+    if (buffer.size() < offset + 4 + 1) {
+        throw std::runtime_error("Invalid publish ack size");
+    }
     ack.request_id = decode_u32(buffer, offset);
     offset += 4;
     ack.result = static_cast<PublishResult>(buffer[offset]);
@@ -193,17 +217,35 @@ void encode_deliver_message(DeliverMessage& message, std::vector<uint8_t>& buffe
 // decode a deliver message
 void decode_deliver_message(DeliverMessage& message, std::vector<uint8_t>& buffer) {
     size_t offset = kFrameHeaderSize;
+    if (buffer.size() < offset + 8) {
+        throw std::runtime_error("Invalid deliver message size");
+    }
     message.subscription_id = decode_u64(buffer, offset);
     offset += 8;
+    if (buffer.size() < offset + 2) {
+        throw std::runtime_error("Invalid deliver message size. Not enough data for topic size");
+    }
     const uint16_t topic_size = decode_u16(buffer, offset);
     offset += 2;
+    if (buffer.size() < offset + topic_size) {
+        throw std::runtime_error("Invalid deliver message size. Not enough data for topic");
+    }
     message.topic = std::string(buffer.begin() + static_cast<std::ptrdiff_t>(offset),
                                 buffer.begin() + static_cast<std::ptrdiff_t>(offset + topic_size));
     offset += topic_size;
+    if (buffer.size() < offset + 8) {
+        throw std::runtime_error("Invalid deliver message size. Not enough data for sequence");
+    }
     message.sequence = decode_u64(buffer, offset);
     offset += 8;
+    if (buffer.size() < offset + 4) {
+        throw std::runtime_error("Invalid deliver message size. Not enough data for payload size");
+    }
     const uint32_t payload_size = decode_u32(buffer, offset);
     offset += 4;
+    if (payload_size > buffer.size() || offset > buffer.size() - payload_size) {
+        throw std::runtime_error("Invalid deliver message size. Not enough data for payload");
+    }
     message.payload = std::vector<uint8_t>(
         buffer.begin() + static_cast<std::ptrdiff_t>(offset),
         buffer.begin() + static_cast<std::ptrdiff_t>(offset + payload_size));
@@ -217,6 +259,9 @@ void encode_close_request(CloseRequest& request, std::vector<uint8_t>& buffer) {
 // decode a close request
 void decode_close_request(CloseRequest& request, std::vector<uint8_t>& buffer) {
     size_t offset = kFrameHeaderSize;
+    if (buffer.size() < offset + 4) {
+        throw std::runtime_error("Invalid close request size");
+    }
     request.request_id = decode_u32(buffer, offset);
 }
 
@@ -228,6 +273,9 @@ void encode_close_ack(CloseAck& ack, std::vector<uint8_t>& buffer) {
 // decode a close ack
 void decode_close_ack(CloseAck& ack, std::vector<uint8_t>& buffer) {
     size_t offset = kFrameHeaderSize;
+    if (buffer.size() < offset + 4) {
+        throw std::runtime_error("Invalid close ack size");
+    }
     ack.request_id = decode_u32(buffer, offset);
 }
 
@@ -240,6 +288,9 @@ void encode_unsubscribe_ack(UnsubscribeAck& ack, std::vector<uint8_t>& buffer) {
 // decode a unsubscribe ack
 void decode_unsubscribe_ack(UnsubscribeAck& ack, std::vector<uint8_t>& buffer) {
     size_t offset = kFrameHeaderSize;
+    if (buffer.size() < offset + 4 + 8) {
+        throw std::runtime_error("Invalid unsubscribe ack size");
+    }
     ack.request_id = decode_u32(buffer, offset);
     offset += 4;
     ack.subscription_id = decode_u64(buffer, offset);

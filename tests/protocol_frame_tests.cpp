@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -253,4 +254,106 @@ TEST(ProtocolFrameRoundTrip, IntegerHelpers_BigEndian) {
     EXPECT_EQ(buffer[5], 0x01);
     EXPECT_EQ(buffer[6], 0x01);
     EXPECT_EQ(buffer[13], 0xEF);
+}
+
+// One corrupt-length case per frame type: decoder must throw, not OOB-read.
+
+TEST(ProtocolFrameCorruptLength, SubscribeRequest) {
+    std::vector<uint8_t> buffer;
+    FrameHeader header{PROTOCOL_VERSION, ProtocolFrameType::SUBSCRIBE};
+    encode_frame_header(header, buffer);
+    encode_u32(/*request_id=*/1, buffer);
+    encode_u16(/*topic_size=*/0xFFFF, buffer);
+    // No topic/group bytes.
+
+    SubscribeRequest decoded;
+    EXPECT_THROW(decode_subscribe_request(decoded, buffer), std::runtime_error);
+}
+
+TEST(ProtocolFrameCorruptLength, UnsubscribeRequest) {
+    std::vector<uint8_t> buffer;
+    FrameHeader header{PROTOCOL_VERSION, ProtocolFrameType::UNSUBSCRIBE};
+    encode_frame_header(header, buffer);
+    encode_u32(/*request_id=*/1, buffer);
+    // Missing subscription_id (u64).
+
+    UnsubscribeRequest decoded;
+    EXPECT_THROW(decode_unsubscribe_request(decoded, buffer), std::runtime_error);
+}
+
+TEST(ProtocolFrameCorruptLength, SubscribeAck) {
+    std::vector<uint8_t> buffer;
+    FrameHeader header{PROTOCOL_VERSION, ProtocolFrameType::SUBSCRIBE_ACK};
+    encode_frame_header(header, buffer);
+    encode_u32(/*request_id=*/1, buffer);
+    // Missing subscription_id (u64).
+
+    SubscribeAck decoded;
+    EXPECT_THROW(decode_subscribe_ack(decoded, buffer), std::runtime_error);
+}
+
+TEST(ProtocolFrameCorruptLength, UnsubscribeAck) {
+    std::vector<uint8_t> buffer;
+    FrameHeader header{PROTOCOL_VERSION, ProtocolFrameType::UNSUBSCRIBE_ACK};
+    encode_frame_header(header, buffer);
+    encode_u32(/*request_id=*/1, buffer);
+    // Missing subscription_id (u64).
+
+    UnsubscribeAck decoded;
+    EXPECT_THROW(decode_unsubscribe_ack(decoded, buffer), std::runtime_error);
+}
+
+TEST(ProtocolFrameCorruptLength, PublishRequest) {
+    std::vector<uint8_t> buffer;
+    FrameHeader header{PROTOCOL_VERSION, ProtocolFrameType::PUBLISH};
+    encode_frame_header(header, buffer);
+    encode_u32(/*request_id=*/1, buffer);
+    encode_u16(/*topic_size=*/0xFFFF, buffer);
+    // No topic/payload bytes.
+
+    PublishRequest decoded;
+    EXPECT_THROW(decode_publish_request(decoded, buffer), std::runtime_error);
+}
+
+TEST(ProtocolFrameCorruptLength, DeliverMessage) {
+    std::vector<uint8_t> buffer;
+    FrameHeader header{PROTOCOL_VERSION, ProtocolFrameType::DELIVER};
+    encode_frame_header(header, buffer);
+    encode_u64(/*subscription_id=*/1, buffer);
+    encode_u16(/*topic_size=*/0xFFFF, buffer);
+    // No topic/sequence/payload bytes.
+
+    DeliverMessage decoded;
+    EXPECT_THROW(decode_deliver_message(decoded, buffer), std::runtime_error);
+}
+
+TEST(ProtocolFrameCorruptLength, PublishAck) {
+    std::vector<uint8_t> buffer;
+    FrameHeader header{PROTOCOL_VERSION, ProtocolFrameType::PUBLISH_ACK};
+    encode_frame_header(header, buffer);
+    encode_u32(/*request_id=*/1, buffer);
+    // Missing result byte.
+
+    PublishAck decoded;
+    EXPECT_THROW(decode_publish_ack(decoded, buffer), std::runtime_error);
+}
+
+TEST(ProtocolFrameCorruptLength, CloseRequest) {
+    std::vector<uint8_t> buffer;
+    FrameHeader header{PROTOCOL_VERSION, ProtocolFrameType::CLOSE};
+    encode_frame_header(header, buffer);
+    // Missing request_id (u32).
+
+    CloseRequest decoded;
+    EXPECT_THROW(decode_close_request(decoded, buffer), std::runtime_error);
+}
+
+TEST(ProtocolFrameCorruptLength, CloseAck) {
+    std::vector<uint8_t> buffer;
+    FrameHeader header{PROTOCOL_VERSION, ProtocolFrameType::CLOSE_ACK};
+    encode_frame_header(header, buffer);
+    // Missing request_id (u32).
+
+    CloseAck decoded;
+    EXPECT_THROW(decode_close_ack(decoded, buffer), std::runtime_error);
 }

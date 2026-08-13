@@ -2,64 +2,69 @@
 #define DISPATCHER_H
 
 #include "message_broker.h"
-//#include "subscriber.h"
-//#include "publisher.h"
+#include "broker_client.h"
+#include "protocol_frame.h"
+
+#include <atomic>
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <string>
 
 class Dispatcher {
 public:
-virtual void publish(const std::string& topic, int id, const std::string& payload) = 0;
-virtual SubscriptionToken subscribe(const std::string& topic) = 0;
-virtual void unsubscribe(const SubscriptionToken& token) = 0;
+    virtual ~Dispatcher() = default;
+    virtual void publish(const std::string& topic, int id, const std::string& payload) = 0;
+    virtual SubscriptionToken subscribe(const std::string& topic) = 0;
+    virtual void unsubscribe(const SubscriptionToken& token) = 0;
 };
 
 class CompeteConsumerDispatcher : public Dispatcher {
 public:
-    explicit CompeteConsumerDispatcher(MessageBroker& broker) : bro(broker) {}
+    explicit CompeteConsumerDispatcher(MessageBroker& broker);
 
-    void publish(const std::string& topic, int id, const std::string& payload) override {
-        Message msg(id);
-        msg.setPayload(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
-        // for compete consumer, generate a group name based on the topic. 
-        // We will use the topic name as the group name.
-        std::string group = topic;
-        bro.publish(topic, group, msg, true);
-    }
+    void publish(const std::string& topic, int id, const std::string& payload) override;
+    SubscriptionToken subscribe(const std::string& topic) override;
+    void unsubscribe(const SubscriptionToken& token) override;
 
-    SubscriptionToken subscribe(const std::string& topic) override {
-        // for compete consumer, the topic name already acts as the group name
-        std::string group = topic;
-        return bro.subscribe(topic, group);
-    }
-
-    void unsubscribe(const SubscriptionToken& token) override {
-        bro.unsubscribe(token);
-    }
 private:
     MessageBroker& bro;
 };
 
 class FanoutDispatcher : public Dispatcher {
 public:
-    explicit FanoutDispatcher(MessageBroker& broker) : bro(broker) {}
+    explicit FanoutDispatcher(MessageBroker& broker);
 
-    void publish(const std::string& topic, int id, const std::string& payload) override {
-        Message msg(id);
-        msg.setPayload(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
-        // for fanout publish, group is not needed. Message will be broadcast to all subscribers.
-        bro.publish(topic, msg);
-    }
-    SubscriptionToken subscribe(const std::string& topic) override {
-        // for fanout subscribe generate a unique group name for each subscriber.
-        uint64_t subscriberId = nextSubscriberId_.fetch_add(1);
-        std::string group = topic + "_" + "sub_" + std::to_string(subscriberId);
-        return bro.subscribe(topic, group);
-    }
-    void unsubscribe(const SubscriptionToken& token) override {
-        bro.unsubscribe(token);
-    }
-private:   
-     MessageBroker& bro;
-     inline static std::atomic<uint64_t> nextSubscriberId_{1};
+    void publish(const std::string& topic, int id, const std::string& payload) override;
+    SubscriptionToken subscribe(const std::string& topic) override;
+    void unsubscribe(const SubscriptionToken& token) override;
+
+private:
+    MessageBroker& bro;
+    inline static std::atomic<uint64_t> nextSubscriberId_{1};
+};
+
+class NetworkDispatcher : public Dispatcher {
+public:
+    NetworkDispatcher(const std::string& host, int port);
+    ~NetworkDispatcher() override;
+
+    void handle_deliver_message(const DeliverMessage& message);
+
+    void publish(const std::string& topic, int id, const std::string& payload) override;
+    SubscriptionToken subscribe(const std::string& topic) override;
+    void unsubscribe(const SubscriptionToken& token) override;
+
+    // True after SubscribeAck was applied via on_subscribe_ack for this id.
+    bool hasSubscription(uint64_t subscription_id) const;
+
+private:
+    void on_subscribe_ack(const SubscribeAck& ack);
+
+    BrokerClient broker_client_;
+    std::map<uint64_t, SubscriptionToken> subscription_tokens_;
+    std::map<uint32_t, SubscriptionToken> pending_by_request_id_;
+    mutable std::mutex subscription_tokens_mutex_;
 };
 
 #endif
