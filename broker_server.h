@@ -51,7 +51,16 @@ public:
     }
 
 private:
-    void acceptLoop();
+    // Dispatch one decoded frame (header + body already in |frame|).
+    // |frame| is non-const because the codec decode APIs take a mutable buffer.
+    void handleFrame(const FrameHeader& header, std::vector<uint8_t>& frame);
+
+    void handleSubscribe(std::vector<uint8_t>& frame);
+    void handleUnsubscribe(std::vector<uint8_t>& frame);
+    void handlePublish(std::vector<uint8_t>& frame);
+    void handleClose(std::vector<uint8_t>& frame);
+
+    void run();
     void handleClientConnection(int client_socket);
 
     // Remove finished sessions from |sessions_| (called from acceptLoop or stop).
@@ -61,6 +70,7 @@ private:
     uint16_t port_;
 
     int listen_fd_ = -1;
+    int epoll_fd_ = -1;
     std::thread accept_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> listening_{false};
