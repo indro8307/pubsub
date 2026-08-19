@@ -43,17 +43,20 @@ void BrokerServer::stop() {
         ::close(epoll_fd_);
         epoll_fd_ = -1;
     }      
-    std::vector<std::shared_ptr<Session>> sessions;
+    std::map<int, std::shared_ptr<Session>> sessions;
     {
         std::lock_guard<std::mutex> lock(sessions_mtx_);
         sessions.swap(sessions_);
+        read_bufs_.clear();
     }
-    for (auto& session : sessions) {
+    for (auto& [fd, session] : sessions) {
+        (void)fd;
         if (session) {
             session->requestStop();
         }
     }
-    for (auto& session : sessions) {
+    for (auto& [fd, session] : sessions) {
+        (void)fd;
         if (session) {
             session->join();
         }
@@ -112,7 +115,7 @@ void BrokerServer::run() {
 
         // Timeout so stop() can join even if shutdown() does not wake a listening
         // socket. We will replace this with an eventfd wakeup later.
-        constexpr int kMaxEvents = 16;
+        constexpr int kMaxEvents = 64;
         constexpr int kWaitTimeoutMs = 100;
         epoll_event events[kMaxEvents];
 
@@ -135,38 +138,49 @@ void BrokerServer::run() {
                 const int fd = events[i].data.fd;
                 const uint32_t ev_mask = events[i].events;
 
-                // Step 2: only the listen socket is in epoll. Client fds come later.
-                if (fd != listen_fd_) {
-                    continue;
-                }
-                if (ev_mask & (EPOLLERR | EPOLLHUP)) {
-                    if (!running_.load(std::memory_order_acquire)) {
-                        break;
-                    }
-                    throw std::runtime_error("Listen socket error");
-                }
-                if (ev_mask & EPOLLIN) {
-                    // Level-triggered: accept until the backlog is empty (EAGAIN).
-                    while (true) {
-                        sockaddr_in client_addr{};
-                        socklen_t client_addr_len = sizeof(client_addr);
-                        int client_socket = ::accept(
-                            listen_fd_,
-                            reinterpret_cast<sockaddr*>(&client_addr),
-                            &client_addr_len);
-                        if (client_socket == -1) {
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                break;
-                            }
-                            if (errno == EINTR) {
-                                continue;
-                            }
-                            if (!running_.load(std::memory_order_acquire)) {
-                                break;
-                            }
-                            throw std::runtime_error("Failed to accept connection");
+                if (fd == listen_fd_) {
+                    // event received for the listen socket
+                    if (ev_mask & (EPOLLERR | EPOLLHUP)) {
+                        if (!running_.load(std::memory_order_acquire)) {
+                            break;
                         }
-                        handleClientConnection(client_socket);
+                        throw std::runtime_error("Listen socket error");
+                    }
+                    if (ev_mask & EPOLLIN) {
+                        // Level-triggered: accept until the backlog is empty (EAGAIN).
+                        while (true) {
+                            sockaddr_in client_addr{};
+                            socklen_t client_addr_len = sizeof(client_addr);
+                            int client_socket = ::accept(
+                                listen_fd_,
+                                reinterpret_cast<sockaddr*>(&client_addr),
+                                &client_addr_len);
+                            if (client_socket == -1) {
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                    break;
+                                }
+                                if (errno == EINTR) {
+                                    continue;
+                                }
+                                if (!running_.load(std::memory_order_acquire)) {
+                                    break;
+                                }
+                                throw std::runtime_error("Failed to accept connection");
+                            }
+                            handleClientConnection(client_socket);
+                        }
+                    }
+                }
+                else
+                {
+                    // event received for a client fd
+                    // Client fd: already in epoll. Do not ignore EPOLLIN (level-triggered
+                    // would spin). Read available bytes; parse/handle frames in a later step.
+                    if (ev_mask & EPOLLIN) {
+                        handleClientReadable(fd);
+                    }
+                    if (ev_mask & (EPOLLERR | EPOLLHUP)) {
+                        closeClient(fd);
                     }
                 }
             }
@@ -177,26 +191,169 @@ void BrokerServer::run() {
     listening_.store(false, std::memory_order_release);
 }
 
-// TODO: This may not be required anymore because when ever epoll_wait returns a 
-// new client connection, it will be added to the epoll_wait list and handled there
-// we need not start a new thread for each client connection
 void BrokerServer::handleClientConnection(int client_socket) {
-    // Create a new session instance
-    std::shared_ptr<Session> session = std::make_shared<Session>(client_socket, broker_);
-    // Add session to sessions vector
+    int flags = ::fcntl(client_socket, F_GETFL, 0);
+    if (flags == -1 || ::fcntl(client_socket, F_SETFL, flags | O_NONBLOCK) == -1) {
+        ::close(client_socket);
+        return;
+    }
+
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = client_socket;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_socket, &ev) == -1) {
+        ::close(client_socket);
+        return;
+    }
+
+    auto session = std::make_shared<Session>(client_socket, broker_);
     {
         std::lock_guard<std::mutex> lock(sessions_mtx_);
-        sessions_.push_back(session);
+        sessions_[client_socket] = std::move(session);
     }
-    // Start the session thread
-    session->start();
+}
+
+
+// Read whatever is in the socket (batched recv), append it to pending for this
+// client, then peel off complete frames. One recv can contain many frames, or
+// only part of one frame.
+//
+// For each recv:
+//       - n > 0: append bytes to pending, then loop:
+//              if pending is smaller than 4 bytes, we do not have the length yet.
+//                    break and wait for the next EPOLLIN.
+//              decode frame_len from the first 4 bytes.
+//              if frame_len is invalid, close this client.
+//              if pending is smaller than 4 + frame_len, we do not have the
+//                    full frame yet. break and wait for the next EPOLLIN.
+//              copy the next frame_len bytes (header + body, no length prefix)
+//                    into frame_data, decode header, handle the type.
+//              erase those 4 + frame_len bytes from the front of pending and
+//                    try the next frame in the same pending buffer.
+//       - after we finish parsing, continue the recv loop (more data may already
+//         be in the socket). We only stop on EAGAIN, peer close, or error.
+//       - n == 0: peer closed. close this client.
+//       - n == -1 EAGAIN / EWOULDBLOCK: no more data right now. return.
+//       - n == -1 EINTR: retry recv.
+//       - n == -1 anything else: close this client.
+//
+// TODO: pending.erase(begin, begin + frame_len + 4) after every frame shifts all
+// leftover bytes. If one recv holds many small frames that is O(m*n) copies.
+// where m is the pending size and n is the number of frames.
+// this is a big overhead for many small frames received together since n is large.
+// With few big frames, the overhead is much less because the number of copies decreases (so n is small, m stays same for both cases)
+// Later: walk pending with an offset and erase (or clear) once at the end or at regular intervals.
+
+void BrokerServer::handleClientReadable(int client_fd) {
+    uint8_t buf[4096];
+    while (true) {
+        const ssize_t n = ::recv(client_fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            auto& pending = read_bufs_[client_fd];
+            pending.insert(pending.end(), buf, buf + n);
+            while(pending.size() > 0) {
+                // check if we can decode a frame length
+                if(pending.size() < 4) {
+                    break;
+                }
+                uint32_t frame_len = 0;
+                frame_len = decode_uint32(pending.data(), 0);
+                if (frame_len < 2 || frame_len > PROTOCOL_FRAME_MAX_SIZE) {
+                    closeClient(client_fd);
+                    return;
+                }
+
+                // check if we can read the frame payload
+                if(pending.size() < frame_len+4) {
+                    break;
+                }
+
+                // copy the frame data to a vector
+                std::vector<uint8_t> frame_data(pending.begin()+4, pending.begin()+4+frame_len);
+
+                // decode the frame header first
+                FrameHeader frame_header;
+                decode_frame_header(frame_header, frame_data);
+                if (frame_header.version != PROTOCOL_VERSION) {
+                    closeClient(client_fd);
+                    return;
+                }
+
+                switch (frame_header.type) {
+                    case ProtocolFrameType::PUBLISH: {
+                        handlePublish(frame_data);
+                        //PublishRequest publish_request;
+                        //decode_publish_request(publish_request, frame_data);
+                        //handlePublishFrame(publish_frame);
+                        break;
+                    }
+                    case ProtocolFrameType::SUBSCRIBE: {
+                        // make entry into the sessions map with the client fd as the key.
+                        
+                        handleSubscribe(frame_data);
+                        //SubscribeRequest subscribe_request;
+                        //decode_subscribe_request(subscribe_request, frame_data);
+                        //handleSubscribeFrame(subscribe_frame);
+                        break;
+                    }
+                    case ProtocolFrameType::UNSUBSCRIBE: {
+                        handleUnsubscribe(frame_data);
+                        //UnsubscribeRequest unsubscribe_request;
+                        //decode_unsubscribe_request(unsubscribe_request, frame_data);
+                        //handleUnsubscribeFrame(unsubscribe_frame);
+                        break;
+                    }
+                    default: {
+                        closeClient(client_fd);
+                        return;
+                    }
+                }
+                // slice away the frame payload from the pending data
+                pending.erase(pending.begin(), pending.begin() + frame_len+4);
+            }
+            continue;
+        }
+        if (n == 0) {
+            closeClient(client_fd);
+            return;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;
+        }
+        closeClient(client_fd);
+        return;
+    }
+}
+
+void BrokerServer::closeClient(int client_fd) {
+    if (epoll_fd_ >= 0) {
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
+    }
+    std::shared_ptr<Session> session;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx_);
+        auto it = sessions_.find(client_fd);
+        if (it == sessions_.end()) {
+            return;
+        }
+        session = std::move(it->second);
+        sessions_.erase(it);
+        read_bufs_.erase(client_fd);
+    }
+    // Session dtor closes the fd after requestStop/join (no reader thread in step 3).
 }
 
 void BrokerServer::reapFinishedSessions() {
     std::lock_guard<std::mutex> lock(sessions_mtx_);
-    sessions_.erase(std::remove_if(sessions_.begin(), sessions_.end(),
-                                   [](const std::shared_ptr<Session>& session) {
-                                       return session && !session->isRunning();
-                                   }),
-                    sessions_.end());
+    for (auto it = sessions_.begin(); it != sessions_.end();) {
+        if (it->second && !it->second->isRunning()) {
+            read_bufs_.erase(it->first);
+            it = sessions_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }

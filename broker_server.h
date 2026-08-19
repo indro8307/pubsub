@@ -6,9 +6,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // TCP accept loop for the broker daemon (docs/protocol.md).
@@ -47,7 +49,13 @@ public:
     // if they have not been reaped yet).
     std::vector<std::shared_ptr<Session>> sessions() const {
         std::lock_guard<std::mutex> lock(sessions_mtx_);
-        return sessions_;
+        std::vector<std::shared_ptr<Session>> out;
+        out.reserve(sessions_.size());
+        for (const auto& [fd, session] : sessions_) {
+            (void)fd;
+            out.push_back(session);
+        }
+        return out;
     }
 
 private:
@@ -62,6 +70,8 @@ private:
 
     void run();
     void handleClientConnection(int client_socket);
+    void handleClientReadable(int client_fd);
+    void closeClient(int client_fd);
 
     // Remove finished sessions from |sessions_| (called from acceptLoop or stop).
     void reapFinishedSessions();
@@ -76,7 +86,8 @@ private:
     std::atomic<bool> listening_{false};
 
     mutable std::mutex sessions_mtx_;
-    std::vector<std::shared_ptr<Session>> sessions_;
+    std::map<int, std::shared_ptr<Session>> sessions_;
+    std::unordered_map<int, std::vector<uint8_t>> read_bufs_;
 };
 
 #endif
