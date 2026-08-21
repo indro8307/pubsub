@@ -12,6 +12,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+Subscription::Subscription(SubscriptionToken token, std::shared_ptr<Session> session)
+    : token_(std::move(token)), session_(std::move(session)) {}
+
+Subscription::~Subscription() = default;
+
 BrokerServer::BrokerServer(MessageBroker& broker, uint16_t port)
     : broker_(broker), port_(port) {}
 
@@ -179,6 +184,9 @@ void BrokerServer::run() {
                     if (ev_mask & EPOLLIN) {
                         handleClientReadable(fd);
                     }
+                    if (ev_mask & EPOLLOUT) {
+                        handleClientWritable(fd);
+                    }
                     if (ev_mask & (EPOLLERR | EPOLLHUP)) {
                         closeClient(fd);
                     }
@@ -206,7 +214,7 @@ void BrokerServer::handleClientConnection(int client_socket) {
         return;
     }
 
-    auto session = std::make_shared<Session>(client_socket, broker_);
+    auto session = std::make_shared<Session>(client_socket);
     {
         std::lock_guard<std::mutex> lock(sessions_mtx_);
         sessions_[client_socket] = std::move(session);
@@ -288,12 +296,40 @@ void BrokerServer::handleClientReadable(int client_fd) {
                         break;
                     }
                     case ProtocolFrameType::SUBSCRIBE: {
-                        // make entry into the sessions map with the client fd as the key.
-                        
-                        handleSubscribe(frame_data);
-                        //SubscribeRequest subscribe_request;
-                        //decode_subscribe_request(subscribe_request, frame_data);
-                        //handleSubscribeFrame(subscribe_frame);
+                        // look for an entry in the sessions_ map with the client fd as the key.
+                        // Ideally it should be found because the tcp connection is already established.
+                        // If not found, close the client.
+                        auto it = sessions_.find(client_fd);
+                        if (it == sessions_.end()) {
+                            closeClient(client_fd);
+                            return;
+                        }
+                        // decode the subscribe request
+                        SubscribeRequest subscribe_request;
+                        decode_subscribe_request(subscribe_request, frame_data);
+                        if (subscribe_request.topic.empty()) {
+                            closeClient(client_fd);
+                            return;
+                        }
+
+                        // subscribe to the topic
+                        SubscriptionToken token = broker_.subscribe(subscribe_request.topic, subscribe_request.group);
+                        // create a new subscription
+                        auto subscription = std::make_unique<Subscription>(token, it->second);
+                        // add the subscription to the topic
+                        subscriptions_by_topics_[subscribe_request.topic].push_back(std::move(subscription));
+
+                        // generate a subscribe ack
+                        SubscribeAck ack;
+                        ack.request_id = subscribe_request.request_id;
+                        ack.subscription_id = token.id;
+                    
+                        // encode the subscribe ack
+                        std::vector<uint8_t> body;
+                        encode_subscribe_ack(ack, body);
+                    
+                        // enqueue the frame into the write buffer of the session
+                        buildAndSendFrame(client_fd, ProtocolFrameType::SUBSCRIBE_ACK, body, it->second);
                         break;
                     }
                     case ProtocolFrameType::UNSUBSCRIBE: {
@@ -328,11 +364,37 @@ void BrokerServer::handleClientReadable(int client_fd) {
     }
 }
 
+void BrokerServer::handleClientWritable(int client_fd) {
+    auto it = sessions_.find(client_fd);
+    if (it == sessions_.end() || !it->second) {
+        return;
+    }
+    std::shared_ptr<Session> session = it->second;
+    FlushResult result = session->flush();
+    if (result == FlushResult::FLUSH_EPOLLOUT) {
+        // fd is already in epoll with EPOLLIN; MOD so we keep reading and
+        // also wake when the socket can accept more writes.
+        epoll_event ev{};
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = client_fd;
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client_fd, &ev);
+    } else if (result == FlushResult::FLUSH_SUCCESS) {
+        // Queue drained; drop EPOLLOUT so we do not spin on a writable socket.
+        epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.fd = client_fd;
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client_fd, &ev);
+    } else if (result == FlushResult::FLUSH_CLOSE) {
+        closeClient(client_fd);
+    }
+}
+
 void BrokerServer::closeClient(int client_fd) {
     if (epoll_fd_ >= 0) {
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);
     }
     std::shared_ptr<Session> session;
+    std::vector<SubscriptionToken> tokens_to_unsub;
     {
         std::lock_guard<std::mutex> lock(sessions_mtx_);
         auto it = sessions_.find(client_fd);
@@ -342,8 +404,30 @@ void BrokerServer::closeClient(int client_fd) {
         session = std::move(it->second);
         sessions_.erase(it);
         read_bufs_.erase(client_fd);
+
+        for (auto topic_it = subscriptions_by_topics_.begin();
+             topic_it != subscriptions_by_topics_.end();) {
+            auto& subs = topic_it->second;
+            for (auto sub_it = subs.begin(); sub_it != subs.end();) {
+                if ((*sub_it)->session_ == session) {
+                    tokens_to_unsub.push_back((*sub_it)->token_);
+                    sub_it = subs.erase(sub_it);
+                } else {
+                    ++sub_it;
+                }
+            }
+            if (subs.empty()) {
+                topic_it = subscriptions_by_topics_.erase(topic_it);
+            } else {
+                ++topic_it;
+            }
+        }
     }
-    // Session dtor closes the fd after requestStop/join (no reader thread in step 3).
+    for (const auto& token : tokens_to_unsub) {
+        if (token.valid()) {
+            broker_.unsubscribe(token);
+        }
+    }
 }
 
 void BrokerServer::reapFinishedSessions() {
@@ -355,5 +439,44 @@ void BrokerServer::reapFinishedSessions() {
         } else {
             ++it;
         }
+    }
+}
+
+void BrokerServer::buildAndSendFrame(int client_fd, ProtocolFrameType type, const std::vector<uint8_t>& body, 
+                                           std::shared_ptr<Session> session) 
+{
+    FrameHeader header;
+    header.version = PROTOCOL_VERSION;
+    header.type = type;
+
+    std::vector<uint8_t> frame;
+    encode_frame_header(header, frame);
+    frame.insert(frame.end(), body.begin(), body.end());   // copy 1 
+
+    if (frame.size() > PROTOCOL_FRAME_MAX_SIZE) {
+        throw std::runtime_error("Outbound frame exceeds PROTOCOL_FRAME_MAX_SIZE");
+    }
+
+    std::vector<uint8_t> wire;
+    encode_u32(static_cast<uint32_t>(frame.size()), wire);
+    wire.insert(wire.end(), frame.begin(), frame.end());   // copy 2 copy from frame to wire.
+
+    session->enqueueFrame(type, wire);
+    FlushResult result = session->flush();
+    if (result == FlushResult::FLUSH_EPOLLOUT) {
+        // fd is already in epoll with EPOLLIN; MOD so we keep reading and
+        // also wake when the socket can accept more writes.
+        epoll_event ev{};
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = client_fd;
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client_fd, &ev);
+    } else if (result == FlushResult::FLUSH_SUCCESS) {
+        // Queue drained; drop EPOLLOUT so we do not spin on a writable socket.
+        epoll_event ev{};
+        ev.events = EPOLLIN;
+        ev.data.fd = client_fd;
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client_fd, &ev);
+    } else if (result == FlushResult::FLUSH_CLOSE) {
+        closeClient(client_fd);
     }
 }

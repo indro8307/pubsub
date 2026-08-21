@@ -45,8 +45,8 @@ bool writeExact(int fd, const void* buf, size_t n) {
 
 }  // namespace
 
-Session::Session(int client_fd, MessageBroker& broker)
-    : client_fd_(client_fd), broker_(broker) {}
+Session::Session(int client_fd)
+    : client_fd_(client_fd), offset_(0) {}
 
 Session::~Session() {
     requestStop();
@@ -338,8 +338,11 @@ void Session::cleanupSubscriptions() {
     }
 }
 
-void Session::enqueueFrame(shared_ptr<const EncodedFrame> encoded_frame) {
-    queue_.push_back(encoded_frame);
+void Session::enqueueFrame(ProtocolFrameType type, const std::vector<uint8_t>& body) {
+    auto encoded_frame = std::make_shared<EncodedFrame>();
+    encoded_frame->type_ = type;
+    encoded_frame->body_ = body;
+    queue_.push_back(std::move(encoded_frame));
 }
 
 FlushResult Session::flush()

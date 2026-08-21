@@ -13,18 +13,21 @@
 #include <unordered_map>
 #include <vector>
 
-// TCP accept loop for the broker daemon (docs/protocol.md).
-//
-// Ownership:
-//   - Owns the listen socket and the accept thread.
-//   - Holds a reference to an existing MessageBroker (does not own it and
-//     does not start networking inside MessageBroker).
-//   - Spawns one Session per accepted connection. Sessions are joined on
-//     stop(), not from the accept loop, so accept stays non-blocking w.r.t.
-//     client lifetime.
-//
-// Minimal surface for Phase 3 v1: start / stop only. No TLS, no backlog
-// tuning beyond a default, no connection limits yet.
+// A Subscription is a single subscription to a topic.
+// Each subscription is associated with a session/Connection.
+class Subscription {
+public:
+    Subscription(SubscriptionToken token, std::shared_ptr<Session> session);
+    ~Subscription();
+
+    Subscription(const Subscription&) = delete;
+    Subscription& operator=(const Subscription&) = delete;
+
+    SubscriptionToken token_;
+    std::shared_ptr<Session> session_;
+};
+
+
 class BrokerServer {
 public:
     BrokerServer(MessageBroker& broker, uint16_t port);
@@ -63,18 +66,17 @@ private:
     // |frame| is non-const because the codec decode APIs take a mutable buffer.
     void handleFrame(const FrameHeader& header, std::vector<uint8_t>& frame);
 
-    void handleSubscribe(std::vector<uint8_t>& frame);
-    void handleUnsubscribe(std::vector<uint8_t>& frame);
-    void handlePublish(std::vector<uint8_t>& frame);
-    void handleClose(std::vector<uint8_t>& frame);
-
     void run();
     void handleClientConnection(int client_socket);
     void handleClientReadable(int client_fd);
+    void handleClientWritable(int client_fd);
     void closeClient(int client_fd);
 
     // Remove finished sessions from |sessions_| (called from acceptLoop or stop).
     void reapFinishedSessions();
+
+    void buildAndSendFrame(int client_fd, ProtocolFrameType type, const std::vector<uint8_t>& body, 
+                                           std::shared_ptr<Session> session);
 
     MessageBroker& broker_;
     uint16_t port_;
@@ -88,6 +90,7 @@ private:
     mutable std::mutex sessions_mtx_;
     std::map<int, std::shared_ptr<Session>> sessions_;
     std::unordered_map<int, std::vector<uint8_t>> read_bufs_;
+    std::map<std::string, std::vector<std::unique_ptr<Subscription>>> subscriptions_by_topics_;
 };
 
 #endif
