@@ -146,6 +146,16 @@ bool MessageBroker::publish(const std::string topic, const Message& msg) {
     return true;
 }
 
+bool MessageBroker::allocateSequence(const std::string& topic, uint64_t& out_seq) {
+    std::unique_lock<std::mutex> lock(topic_mtx);
+    auto topic_it = topics.find(topic);
+    if (topic_it == topics.end()) {
+        return false;
+    }
+    out_seq = topic_it->second.nextSeq++;
+    return true;
+}
+
 std::size_t MessageBroker::groupCount(const std::string& topic) const {
     std::unique_lock<std::mutex> lock(topic_mtx);
     auto topic_it = topics.find(topic);

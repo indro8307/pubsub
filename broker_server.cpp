@@ -289,10 +289,61 @@ void BrokerServer::handleClientReadable(int client_fd) {
 
                 switch (frame_header.type) {
                     case ProtocolFrameType::PUBLISH: {
-                        handlePublish(frame_data);
-                        //PublishRequest publish_request;
-                        //decode_publish_request(publish_request, frame_data);
-                        //handlePublishFrame(publish_frame);
+                        // find the session for the client fd for later use
+                        auto session_it = sessions_.find(client_fd);
+                        if (session_it == sessions_.end()) {
+                            closeClient(client_fd);
+                            return;
+                        }
+                        std::shared_ptr<Session> publisher_session = session_it->second;
+                        // decode the publish request
+                        PublishRequest publish_request;
+                        decode_publish_request(publish_request, frame_data);
+                        if (publish_request.topic.empty()) {
+                            closeClient(client_fd);
+                            return;
+                        }
+
+                        auto send_publish_ack = [&](PublishResult result) {
+                            PublishAck ack;
+                            ack.request_id = publish_request.request_id;
+                            ack.result = result;
+                            std::vector<uint8_t> body;
+                            encode_publish_ack(ack, body);
+                            buildAndSendFrame(client_fd, ProtocolFrameType::PUBLISH_ACK, body,
+                                              publisher_session);
+                        };
+
+                        // find the subscriptions for the topic
+                        auto topic_it = subscriptions_by_topics_.find(publish_request.topic);
+                        if (topic_it == subscriptions_by_topics_.end() ||
+                            topic_it->second.empty()) {
+                            send_publish_ack(PublishResult::NO_SUBSCRIBERS);
+                            break;
+                        }
+
+                        // Sequence from MessageBroker only; do not enqueue into group queues.
+                        uint64_t sequence = 0;
+                        if (!broker_.allocateSequence(publish_request.topic, sequence)) {
+                            send_publish_ack(PublishResult::NO_SUBSCRIBERS);
+                            break;
+                        }
+
+                        DeliverMessage deliver;
+                        deliver.topic = publish_request.topic;
+                        deliver.sequence = sequence;
+                        deliver.payload = publish_request.payload;
+
+                        for (auto& subscription : topic_it->second) {
+                            deliver.subscription_id = subscription->token_.id;
+                            std::vector<uint8_t> body;
+                            encode_deliver_message(deliver, body);
+                            const int sub_fd = subscription->session_->fd();
+                            buildAndSendFrame(sub_fd, ProtocolFrameType::DELIVER, body,
+                                              subscription->session_);
+                        }
+
+                        send_publish_ack(PublishResult::ACCEPTED);
                         break;
                     }
                     case ProtocolFrameType::SUBSCRIBE: {
