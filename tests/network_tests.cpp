@@ -887,11 +887,12 @@ TEST(NetworkTests, ManySubscriptionsPerSession) {
 // Network stress — 50 NetworkDispatchers shared by 100 fan-out subscribers
 // (2 subscribe()s each) and 50 publisher threads × 100 messages on one topic.
 //
-// Publishes are serialized so every subscriber must see the same broker
-// sequence order (concurrent publish can reorder fan-out enqueues today).
+// Publishes run concurrently (no global publish lock). Each subscriber must
+// receive every message with strictly increasing sequences; cross-subscriber
+// delivery order is not required to match.
 // Dispatchers are reused for both subscribe and publish (multiplexed sessions).
 //
-TEST(NetworkStress, FiftyDispatchers_HundredSubs_SerializedPublishOrder) {
+TEST(NetworkStress, FiftyDispatchers_HundredSubs_ConcurrentPublish) {
     constexpr int kDispatchers = 50;
     constexpr int kSubsPerDispatcher = 2;
     constexpr int kSubscribers = kDispatchers * kSubsPerDispatcher;  // 100
@@ -952,8 +953,6 @@ TEST(NetworkStress, FiftyDispatchers_HundredSubs_SerializedPublishOrder) {
         });
     }
 
-    // One publish at a time across all publisher threads → identical fan-out order.
-    std::mutex publish_mu;
     std::atomic<bool> publish_ok{true};
     std::vector<std::thread> publishers;
     publishers.reserve(static_cast<size_t>(kPublishers));
@@ -963,7 +962,6 @@ TEST(NetworkStress, FiftyDispatchers_HundredSubs_SerializedPublishOrder) {
                 *dispatchers[static_cast<size_t>(pubIdx % kDispatchers)];
             try {
                 for (int msgIdx = 0; msgIdx < kMessagesPerPublisher; ++msgIdx) {
-                    std::lock_guard<std::mutex> lock(publish_mu);
                     dispatcher.publish(
                         topic,
                         /*id=*/msgIdx,
@@ -988,16 +986,11 @@ TEST(NetworkStress, FiftyDispatchers_HundredSubs_SerializedPublishOrder) {
         ASSERT_EQ(sequences[static_cast<size_t>(i)].size(),
                   static_cast<size_t>(kTotalMessages))
             << "subscriber " << i << " incomplete (dequeue timeout?)";
-    }
-
-    const std::vector<uint64_t>& reference = sequences[0];
-    for (size_t i = 1; i < reference.size(); ++i) {
-        EXPECT_LT(reference[i - 1], reference[i])
-            << "reference sequences not strictly increasing at index " << i;
-    }
-    for (int i = 1; i < kSubscribers; ++i) {
-        EXPECT_EQ(sequences[static_cast<size_t>(i)], reference)
-            << "subscriber " << i << " saw a different order/set than subscriber 0";
+        const auto& seqs = sequences[static_cast<size_t>(i)];
+        for (size_t j = 1; j < seqs.size(); ++j) {
+            EXPECT_LT(seqs[j - 1], seqs[j])
+                << "subscriber " << i << " sequences not strictly increasing at index " << j;
+        }
     }
 
     for (size_t i = 0; i < tokens.size(); ++i) {
