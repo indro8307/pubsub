@@ -404,6 +404,10 @@ bool BrokerServer::handlePublish(int client_fd, std::vector<uint8_t>& frame_data
         return true;
     }
 
+    // ACK before fan-out so the publisher RTT is not held by DELIVER writes
+    // (same critical-path shape as enqueue-then-ack in the threaded design).
+    send_publish_ack(PublishResult::ACCEPTED);
+
     DeliverMessage deliver;
     deliver.topic = publish_request.topic;
     deliver.sequence = sequence;
@@ -418,7 +422,6 @@ bool BrokerServer::handlePublish(int client_fd, std::vector<uint8_t>& frame_data
                           subscription->session_);
     }
 
-    send_publish_ack(PublishResult::ACCEPTED);
     return true;
 }
 
