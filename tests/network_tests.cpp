@@ -229,7 +229,7 @@ TEST(NetworkTests, ClientConnectsToServer) {
     ASSERT_EQ(sessions.size(), 1u);
     ASSERT_NE(sessions[0], nullptr);
     EXPECT_TRUE(sessions[0]->isRunning());
-    EXPECT_EQ(sessions[0]->delivererCount(), 0u);
+    EXPECT_EQ(sessions[0]->subscriptionIds().size(), 0u);
 
     client.stop();
     server.stop();
@@ -246,7 +246,7 @@ TEST(NetworkTests, SubscribeReturnsTokenAndCreatesDeliverer) {
     NetworkDispatcher dispatcher(kHost, static_cast<int>(port));
     ASSERT_TRUE(waitForOneRunningSession(server));
 
-    EXPECT_EQ(server.sessions()[0]->delivererCount(), 0u);
+    EXPECT_EQ(server.sessions()[0]->subscriptionIds().size(), 0u);
     EXPECT_EQ(broker.subscriptionCount(), 0u);
 
     SubscriptionToken token = dispatcher.subscribe(kTopic);
@@ -262,10 +262,10 @@ TEST(NetworkTests, SubscribeReturnsTokenAndCreatesDeliverer) {
         [&] {
             const auto sessions = server.sessions();
             return sessions.size() == 1 && sessions[0] &&
-                   sessions[0]->delivererCount() == 1;
+                   sessions[0]->subscriptionIds().size() == 1;
         },
         2s));
-    EXPECT_EQ(server.sessions()[0]->delivererCount(), 1u);
+    EXPECT_EQ(server.sessions()[0]->subscriptionIds().size(), 1u);
 
     dispatcher.unsubscribe(token);
     server.stop();
@@ -286,7 +286,7 @@ TEST(NetworkTests, PublishAfterSubscribeDeliversToClient) {
     SubscriptionToken token = dispatcher.subscribe(kTopic);
     ASSERT_TRUE(token.valid());
     ASSERT_TRUE(waitUntil(
-        [&] { return server.sessions()[0]->delivererCount() == 1; }, 2s));
+        [&] { return server.sessions()[0]->subscriptionIds().size() == 1; }, 2s));
 
     dispatcher.publish(kTopic, /*id=*/7, payload);
 
@@ -317,7 +317,7 @@ TEST(NetworkTests, UnsubscribeStopsDelivererAndDropsBrokerSub) {
     ASSERT_TRUE(waitUntil(
         [&] {
             return broker.subscriptionCount() == 1 &&
-                   server.sessions()[0]->delivererCount() == 1;
+                   server.sessions()[0]->subscriptionIds().size() == 1;
         },
         2s));
 
@@ -327,7 +327,7 @@ TEST(NetworkTests, UnsubscribeStopsDelivererAndDropsBrokerSub) {
     ASSERT_TRUE(waitUntil(
         [&] {
             return broker.subscriptionCount() == 0 &&
-                   server.sessions()[0]->delivererCount() == 0;
+                   server.sessions()[0]->subscriptionIds().size() == 0;
         },
         2s));
     EXPECT_FALSE(subscriber.hasSubscription(subscription_id));
@@ -411,7 +411,7 @@ TEST(NetworkTests, ClientDisconnectCleansServerSubscriptions) {
         ASSERT_TRUE(token.valid());
         ASSERT_TRUE(waitUntil(
             [&] {
-                return broker.subscriptionCount() == 1 && session->delivererCount() == 1;
+                return broker.subscriptionCount() == 1 && session->subscriptionIds().size() == 1;
             },
             2s));
         // Destructor stops BrokerClient without sending UNSUBSCRIBE.
@@ -421,7 +421,7 @@ TEST(NetworkTests, ClientDisconnectCleansServerSubscriptions) {
         << "Broker still has subscriptions after client disconnect";
     ASSERT_TRUE(waitUntil(
         [&] {
-            return session && !session->isRunning() && session->delivererCount() == 0;
+            return session && !session->isRunning() && session->subscriptionIds().size() == 0;
         },
         2s))
         << "Session did not finish / join deliverers after client disconnect";
@@ -451,7 +451,7 @@ TEST(NetworkTests, CloseFrameAcksAndTearsDownSession) {
     ASSERT_EQ(sub_ack->type, ProtocolFrameType::SUBSCRIBE_ACK);
     ASSERT_NE(sub_ack->subscribe_ack.subscription_id, 0u);
     ASSERT_TRUE(waitUntil(
-        [&] { return broker.subscriptionCount() == 1 && session->delivererCount() == 1; },
+        [&] { return broker.subscriptionCount() == 1 && session->subscriptionIds().size() == 1; },
         2s));
 
     const uint32_t close_req = client.generateRequestId();
@@ -463,7 +463,7 @@ TEST(NetworkTests, CloseFrameAcksAndTearsDownSession) {
     ASSERT_TRUE(waitUntil(
         [&] {
             return !session->isRunning() && broker.subscriptionCount() == 0 &&
-                   session->delivererCount() == 0;
+                   session->subscriptionIds().size() == 0;
         },
         2s))
         << "CLOSE did not tear down session / subscriptions";
@@ -513,16 +513,16 @@ TEST(NetworkTests, ReaderExitRunsCleanupSubscriptions) {
     ASSERT_TRUE(token.valid());
     ASSERT_TRUE(waitUntil(
         [&] {
-            return broker.subscriptionCount() == 1 && session->delivererCount() == 1;
+            return broker.subscriptionCount() == 1 && session->subscriptionIds().size() == 1;
         },
         2s));
 
-    session->requestStop();
+    ::shutdown(session->fd(), SHUT_RDWR);
 
     ASSERT_TRUE(waitUntil(
         [&] {
             return !session->isRunning() && broker.subscriptionCount() == 0 &&
-                   session->delivererCount() == 0;
+                   session->subscriptionIds().size() == 0;
         },
         2s))
         << "requestStop did not clean deliverers / broker subscriptions";
@@ -648,7 +648,7 @@ TEST(NetworkTests, SubscribeFailureClearsPendingMap) {
     ASSERT_TRUE(waitForOneRunningSession(server));
     auto session = server.sessions()[0];
 
-    session->requestStop();
+    ::shutdown(session->fd(), SHUT_RDWR);
     ASSERT_TRUE(waitUntil([&] { return session && !session->isRunning(); }, 2s));
     // Allow the client receive thread to observe EOF and clear connected_.
     std::this_thread::sleep_for(100ms);
@@ -843,7 +843,7 @@ TEST(NetworkTests, ManySubscriptionsPerSession) {
 
     ASSERT_TRUE(waitUntil(
         [&] {
-            return broker.subscriptionCount() == 3 && session->delivererCount() == 3;
+            return broker.subscriptionCount() == 3 && session->subscriptionIds().size() == 3;
         },
         2s));
     EXPECT_TRUE(subscriber.hasSubscription(token_a.id));
@@ -854,7 +854,7 @@ TEST(NetworkTests, ManySubscriptionsPerSession) {
 
     ASSERT_TRUE(waitUntil(
         [&] {
-            return broker.subscriptionCount() == 2 && session->delivererCount() == 2;
+            return broker.subscriptionCount() == 2 && session->subscriptionIds().size() == 2;
         },
         2s))
         << "Unsubscribe of one sub did not leave the other deliverers";

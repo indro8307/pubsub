@@ -39,8 +39,8 @@ public:
     // Bind, listen, and spawn the accept thread. Throws on bind/listen failure.
     void start();
 
-    // Stop accepting, requestStop() every live session, join them, then join
-    // the accept thread and close the listen socket.
+    // Stop the reactor thread, then close remaining client sockets and drop
+    // in-memory subscription indexes / broker subscriptions.
     void stop();
 
     bool isRunning() const { return running_.load(std::memory_order_acquire); }
@@ -62,9 +62,11 @@ public:
     }
 
 private:
-    // Dispatch one decoded frame (header + body already in |frame|).
-    // |frame| is non-const because the codec decode APIs take a mutable buffer.
-    void handleFrame(const FrameHeader& header, std::vector<uint8_t>& frame);
+    // Returns false if the connection was closed and handleClientReadable should stop.
+    bool handlePublish(int client_fd, std::vector<uint8_t>& frame_data);
+    bool handleSubscribe(int client_fd, std::vector<uint8_t>& frame_data);
+    bool handleUnsubscribe(int client_fd, std::vector<uint8_t>& frame_data);
+    bool handleClose(int client_fd, std::vector<uint8_t>& frame_data);
 
     void run();
     void handleClientConnection(int client_socket);
@@ -90,7 +92,8 @@ private:
     mutable std::mutex sessions_mtx_;
     std::map<int, std::shared_ptr<Session>> sessions_;
     std::unordered_map<int, std::vector<uint8_t>> read_bufs_;
-    std::map<std::string, std::vector<std::unique_ptr<Subscription>>> subscriptions_by_topics_;
+    std::map<std::string, std::vector<std::shared_ptr<Subscription>>> subscriptions_by_topics_;
+    std::map<uint64_t, std::shared_ptr<Subscription>> subscriptions_by_id_;
 };
 
 #endif

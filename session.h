@@ -42,6 +42,17 @@ public:
 
     int fd() const { return client_fd_; }
 
+    // After BrokerServer has shutdown/closed the socket, clear so ~Session does not close again.
+    void clearFd() {
+        client_fd_ = -1;
+        running_.store(false, std::memory_order_release);
+    }
+
+    void addSubscriptionId(uint64_t id) { subscription_ids_.push_back(id); }
+    void removeSubscriptionId(uint64_t id);
+    const std::vector<uint64_t>& subscriptionIds() const { return subscription_ids_; }
+    void clearSubscriptionIds() { subscription_ids_.clear(); }
+
 private:
 
     int client_fd_;
@@ -50,6 +61,9 @@ private:
     // write buffer for sending frames to the client
     std::list<std::shared_ptr<const EncodedFrame>> queue_;
     size_t offset_;  // this indicates how many bytes have been written to the socket for the current frame
+
+    // Subscription ids owned by this connection (reverse index for closeClient).
+    std::vector<uint64_t> subscription_ids_;
 };
 
 #endif
