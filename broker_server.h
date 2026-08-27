@@ -77,7 +77,10 @@ private:
     // Remove finished sessions from |sessions_| (called from acceptLoop or stop).
     void reapFinishedSessions();
 
-    void buildAndSendFrame(int client_fd, ProtocolFrameType type, const std::vector<uint8_t>& body, 
+    // Encode, enqueue, and attempt flush. Does not close the client — callers
+    // must handle FlushResult::FLUSH_CLOSE (avoids reentrant closeClient while
+    // iterating subscription maps).
+    FlushResult buildAndSendFrame(int client_fd, ProtocolFrameType type, const std::vector<uint8_t>& body, 
                                            std::shared_ptr<Session> session);
 
     MessageBroker& broker_;

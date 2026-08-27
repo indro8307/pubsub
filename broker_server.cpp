@@ -379,14 +379,23 @@ bool BrokerServer::handlePublish(int client_fd, std::vector<uint8_t>& frame_data
         return false;
     }
 
+    std::vector<int> fds_to_close;
     auto send_publish_ack = [&](PublishResult result) {
         PublishAck ack;
         ack.request_id = publish_request.request_id;
         ack.result = result;
         std::vector<uint8_t> body;
         encode_publish_ack(ack, body);
-        buildAndSendFrame(client_fd, ProtocolFrameType::PUBLISH_ACK, body,
-                          publisher_session);
+        if (buildAndSendFrame(client_fd, ProtocolFrameType::PUBLISH_ACK, body,
+                              publisher_session) == FlushResult::FLUSH_CLOSE) {
+            fds_to_close.push_back(client_fd);
+        }
+    };
+
+    auto flush_close_fds = [&](){
+        for(auto fd : fds_to_close) {
+            closeClient(fd);
+        }
     };
 
     // find the subscriptions for the topic
@@ -394,14 +403,16 @@ bool BrokerServer::handlePublish(int client_fd, std::vector<uint8_t>& frame_data
     if (topic_it == subscriptions_by_topics_.end() ||
         topic_it->second.empty()) {
         send_publish_ack(PublishResult::NO_SUBSCRIBERS);
-        return true;
+        flush_close_fds();
+        return sessions_.find(client_fd) != sessions_.end();
     }
 
     // Sequence from MessageBroker only; do not enqueue into group queues.
     uint64_t sequence = 0;
     if (!broker_.allocateSequence(publish_request.topic, sequence)) {
         send_publish_ack(PublishResult::NO_SUBSCRIBERS);
-        return true;
+        flush_close_fds();
+        return sessions_.find(client_fd) != sessions_.end();
     }
 
     // ACK before fan-out so the publisher RTT is not held by DELIVER writes
@@ -418,11 +429,17 @@ bool BrokerServer::handlePublish(int client_fd, std::vector<uint8_t>& frame_data
         std::vector<uint8_t> body;
         encode_deliver_message(deliver, body);
         const int sub_fd = subscription->session_->fd();
-        buildAndSendFrame(sub_fd, ProtocolFrameType::DELIVER, body,
-                          subscription->session_);
+        if (sub_fd < 0) {
+            continue;
+        }
+        if (buildAndSendFrame(sub_fd, ProtocolFrameType::DELIVER, body,
+                              subscription->session_) == FlushResult::FLUSH_CLOSE) {
+            fds_to_close.push_back(sub_fd);
+        }
     }
 
-    return true;
+    flush_close_fds();
+    return sessions_.find(client_fd) != sessions_.end();
 }
 
 bool BrokerServer::handleSubscribe(int client_fd, std::vector<uint8_t>& frame_data) {
@@ -462,7 +479,11 @@ bool BrokerServer::handleSubscribe(int client_fd, std::vector<uint8_t>& frame_da
     encode_subscribe_ack(ack, body);
 
     // enqueue the frame into the write buffer of the session
-    buildAndSendFrame(client_fd, ProtocolFrameType::SUBSCRIBE_ACK, body, it->second);
+    if (buildAndSendFrame(client_fd, ProtocolFrameType::SUBSCRIBE_ACK, body,
+                          it->second) == FlushResult::FLUSH_CLOSE) {
+        closeClient(client_fd);
+        return false;
+    }
     return true;
 }
 
@@ -479,33 +500,35 @@ bool BrokerServer::handleUnsubscribe(int client_fd, std::vector<uint8_t>& frame_
     UnsubscribeRequest unsubscribe_request;
     decode_unsubscribe_request(unsubscribe_request, frame_data);
 
-    auto send_unsubscribe_ack = [&]() {
+    auto send_unsubscribe_ack = [&]() -> bool {
         UnsubscribeAck ack;
         ack.request_id = unsubscribe_request.request_id;
         ack.subscription_id = unsubscribe_request.subscription_id;
         std::vector<uint8_t> body;
         encode_unsubscribe_ack(ack, body);
-        buildAndSendFrame(client_fd, ProtocolFrameType::UNSUBSCRIBE_ACK, body, subscriber_session);
+        if (buildAndSendFrame(client_fd, ProtocolFrameType::UNSUBSCRIBE_ACK, body,
+                              subscriber_session) == FlushResult::FLUSH_CLOSE) {
+            closeClient(client_fd);
+            return false;
+        }
+        return true;
     };
 
     // id 0 / unknown id: protocol no-op that still acks (do not close)
     if (unsubscribe_request.subscription_id == 0) {
-        send_unsubscribe_ack();
-        return true;
+        return send_unsubscribe_ack();
     }
 
     // find the subscription from the id map
     auto subscription_it = subscriptions_by_id_.find(unsubscribe_request.subscription_id);
     if (subscription_it == subscriptions_by_id_.end()) {
-        send_unsubscribe_ack();
-        return true;
+        return send_unsubscribe_ack();
     }
     std::shared_ptr<Subscription> subscription = subscription_it->second;
 
     // another client's subscription id: do not unsubscribe them
     if (subscription->session_ != subscriber_session) {
-        send_unsubscribe_ack();
-        return true;
+        return send_unsubscribe_ack();
     }
 
     // unsubscribe from the topic
@@ -531,8 +554,7 @@ bool BrokerServer::handleUnsubscribe(int client_fd, std::vector<uint8_t>& frame_
     subscriber_session->removeSubscriptionId(unsubscribe_request.subscription_id);
 
     // generate an unsubscribe ack
-    send_unsubscribe_ack();
-    return true;
+    return send_unsubscribe_ack();
 }
 
 bool BrokerServer::handleClose(int client_fd, std::vector<uint8_t>& frame_data) {
@@ -653,7 +675,7 @@ void BrokerServer::reapFinishedSessions() {
     }
 }
 
-void BrokerServer::buildAndSendFrame(int client_fd, ProtocolFrameType type, const std::vector<uint8_t>& body, 
+FlushResult BrokerServer::buildAndSendFrame(int client_fd, ProtocolFrameType type, const std::vector<uint8_t>& body, 
                                            std::shared_ptr<Session> session) 
 {
     FrameHeader header;
@@ -687,7 +709,8 @@ void BrokerServer::buildAndSendFrame(int client_fd, ProtocolFrameType type, cons
         ev.events = EPOLLIN;
         ev.data.fd = client_fd;
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client_fd, &ev);
-    } else if (result == FlushResult::FLUSH_CLOSE) {
-        closeClient(client_fd);
     }
+    // FLUSH_CLOSE: do not closeClient here — caller must, so we never reenter
+    // subscription-map mutation from mid fan-out / mid-handler.
+    return result;
 }
