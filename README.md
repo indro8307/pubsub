@@ -2,6 +2,12 @@
 
 **Version:** v0.3.2 — Networked consumer-group broker (Phase 3 v2, epoll server)
 
+**Disclaimer:** This is a personal, non-commercial project undertaken solely for
+self-education and skill development in distributed systems and network
+programming. It is not performed for, on behalf of, or under the direction of
+any employer or client, involves no compensation of any kind, and is not
+offered as a product or service to any third party.
+
 Apps publish messages to named topics; subscribers receive them. Under the hood
 there is one routing engine, `MessageBroker`, built around a **consumer-group**
 model (same idea as Kafka groups): each group gets a copy of every message, and
