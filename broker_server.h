@@ -27,6 +27,24 @@ public:
     std::shared_ptr<Session> session_;
 };
 
+class Group {
+public:
+    Group();
+    explicit Group(const std::string& group_name);
+    ~Group();
+
+    Group(const Group&) = delete;
+    Group& operator=(const Group&) = delete;
+
+    std::shared_ptr<Subscription> getNextSubscription() const;
+    void addSubscription(std::shared_ptr<Subscription> subscription);
+    void removeSubscription(uint64_t subscription_id);
+
+    std::vector<std::shared_ptr<Subscription>> subscriptions_;
+    mutable int index_ = 0;  // round-robin cursor; mutable so getNextSubscription can be const
+    std::string group_name_;
+};
+
 
 class BrokerServer {
 public:
@@ -95,7 +113,7 @@ private:
     mutable std::mutex sessions_mtx_;
     std::map<int, std::shared_ptr<Session>> sessions_;
     std::unordered_map<int, std::vector<uint8_t>> read_bufs_;
-    std::map<std::string, std::vector<std::shared_ptr<Subscription>>> subscriptions_by_topics_;
+    std::map<std::string, std::vector<std::shared_ptr<Group>>> subscriptions_by_topics_groups_;
     std::map<uint64_t, std::shared_ptr<Subscription>> subscriptions_by_id_;
 };
 

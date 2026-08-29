@@ -24,6 +24,40 @@ BrokerServer::~BrokerServer() {
     stop();
 }
 
+Group::Group() : index_(0), group_name_("") {}
+Group::Group(const std::string& group_name) : index_(0), group_name_(group_name) {}
+
+Group::~Group()
+{
+    subscriptions_.clear();
+}
+
+std::shared_ptr<Subscription> Group::getNextSubscription() const {
+    if (subscriptions_.empty()) {
+        return nullptr;
+    }
+    if (index_ < 0 || index_ >= static_cast<int>(subscriptions_.size())) {
+        index_ = 0;
+    }
+    // Return current member, then advance (so the first pick is subscriptions_[0]).
+    std::shared_ptr<Subscription> subscription = subscriptions_[static_cast<size_t>(index_)];
+    index_ = (index_ + 1) % static_cast<int>(subscriptions_.size());
+    return subscription;
+}
+
+void Group::addSubscription(std::shared_ptr<Subscription> subscription) {
+    subscriptions_.push_back(subscription);
+}
+
+void Group::removeSubscription(uint64_t subscription_id) {
+    for (auto it = subscriptions_.begin(); it != subscriptions_.end(); ++it) {
+        if ((*it)->token_.id == subscription_id) {
+            subscriptions_.erase(it);
+            break;
+        }
+    }
+}
+
 void BrokerServer::start() {
     running_.store(true, std::memory_order_release);
     accept_thread_ = std::thread(&BrokerServer::run, this);
@@ -80,7 +114,7 @@ void BrokerServer::stop() {
             session->clearSubscriptionIds();
         }
         // clear the topic and id maps
-        subscriptions_by_topics_.clear();
+        subscriptions_by_topics_groups_.clear();
         subscriptions_by_id_.clear();
     }
     // unsubscribe from all the tokens
@@ -399,9 +433,15 @@ bool BrokerServer::handlePublish(int client_fd, std::vector<uint8_t>& frame_data
     };
 
     // find the subscriptions for the topic
-    auto topic_it = subscriptions_by_topics_.find(publish_request.topic);
-    if (topic_it == subscriptions_by_topics_.end() ||
-        topic_it->second.empty()) {
+    std::vector<std::shared_ptr<Group>> groups;
+    auto groups_it = subscriptions_by_topics_groups_.find(publish_request.topic);
+    if (groups_it == subscriptions_by_topics_groups_.end()) {
+        send_publish_ack(PublishResult::NO_SUBSCRIBERS);
+        flush_close_fds();
+        return sessions_.find(client_fd) != sessions_.end();
+    }
+    groups = groups_it->second;
+    if (groups.empty()) {  // ideally this should not happen, since groups are created when a subscription is added
         send_publish_ack(PublishResult::NO_SUBSCRIBERS);
         flush_close_fds();
         return sessions_.find(client_fd) != sessions_.end();
@@ -424,7 +464,11 @@ bool BrokerServer::handlePublish(int client_fd, std::vector<uint8_t>& frame_data
     deliver.sequence = sequence;
     deliver.payload = publish_request.payload;
 
-    for (auto& subscription : topic_it->second) {
+    for (auto& group : groups) {
+        auto subscription = group->getNextSubscription();
+        if (subscription == nullptr) {
+            continue;
+        }
         deliver.subscription_id = subscription->token_.id;
         std::vector<uint8_t> body;
         encode_deliver_message(deliver, body);
@@ -463,10 +507,35 @@ bool BrokerServer::handleSubscribe(int client_fd, std::vector<uint8_t>& frame_da
     SubscriptionToken token = broker_.subscribe(subscribe_request.topic, subscribe_request.group);
     // create a new subscription
     auto subscription = std::make_shared<Subscription>(token, it->second);
-    // add the subscription to the topic
-    subscriptions_by_topics_[subscribe_request.topic].push_back(subscription);
+    // Check if topic already exists
+    auto groups_it = subscriptions_by_topics_groups_.find(subscribe_request.topic);
+    if (groups_it == subscriptions_by_topics_groups_.end()) {
+        // This means the topic does not exist yet.
+        // create a new topic and group
+        auto group = std::make_shared<Group>(subscribe_request.group);
+        // add the subscription to the group
+        group->addSubscription(subscription);
+        // add the group to the topic map
+        subscriptions_by_topics_groups_[subscribe_request.topic].push_back(group);
+    } else {
+        // topic exists. Check if the group exists in the topic.
+        std::vector<std::shared_ptr<Group>>& groups = groups_it->second;
+        auto group = std::find_if(groups.begin(), groups.end(), [&](const std::shared_ptr<Group>& group) {
+            return group->group_name_ == subscribe_request.group;
+        });
+        if (group != groups.end()) {
+            // group exists. Add the subscription to the group
+            group->addSubscription(subscription);
+        } else {
+            // group does not exist. create a new group
+            auto new_group = std::make_shared<Group>(subscribe_request.group);
+            new_group->addSubscription(subscription);
+            groups.push_back(new_group);
+        }
+    }
     // add the subscription to the id map
     subscriptions_by_id_[token.id] = subscription;
+    // add the subscription id to the session
     it->second->addSubscriptionId(token.id);
 
     // generate a subscribe ack
@@ -534,18 +603,22 @@ bool BrokerServer::handleUnsubscribe(int client_fd, std::vector<uint8_t>& frame_
     // unsubscribe from the topic
     broker_.unsubscribe(subscription->token_);
 
-    // delete the subscription from the topic map
-    auto topic_it = subscriptions_by_topics_.find(subscription->token_.topic);
-    if (topic_it != subscriptions_by_topics_.end()) {
-        std::vector<std::shared_ptr<Subscription>>& subs = topic_it->second;
-        for (auto it = subs.begin(); it != subs.end(); ++it) {
-            if((*it)->token_.id == unsubscribe_request.subscription_id) {
-                subs.erase(it);
-                break;
+    // delete the subscription from the matching (topic, group) only
+    auto groups_it = subscriptions_by_topics_groups_.find(subscription->token_.topic);
+    if (groups_it != subscriptions_by_topics_groups_.end()) {
+        std::vector<std::shared_ptr<Group>>& groups = groups_it->second;
+        for (auto it = groups.begin(); it != groups.end(); ++it) {
+            if ((*it)->group_name_ != subscription->token_.group) {
+                continue;
             }
+            (*it)->removeSubscription(unsubscribe_request.subscription_id);
+            if ((*it)->subscriptions_.empty()) {
+                groups.erase(it);
+            }
+            break;
         }
-        if (subs.empty()) {
-            subscriptions_by_topics_.erase(topic_it);
+        if (groups.empty()) {
+            subscriptions_by_topics_groups_.erase(groups_it);
         }
     }
 
@@ -632,17 +705,22 @@ void BrokerServer::closeClient(int client_fd) {
             std::shared_ptr<Subscription> subscription = subscription_it->second;
             tokens_to_unsub.push_back(subscription->token_);
 
-            auto topic_it = subscriptions_by_topics_.find(subscription->token_.topic);
-            if (topic_it != subscriptions_by_topics_.end()) {
-                auto& subs = topic_it->second;
-                for (auto sub_it = subs.begin(); sub_it != subs.end(); ++sub_it) {
-                    if ((*sub_it)->token_.id == id) {
-                        subs.erase(sub_it);
-                        break;
+            // delete the subscription from the matching (topic, group) only
+            auto groups_it = subscriptions_by_topics_groups_.find(subscription->token_.topic);
+            if (groups_it != subscriptions_by_topics_groups_.end()) {
+                std::vector<std::shared_ptr<Group>>& groups = groups_it->second;
+                for (auto git = groups.begin(); git != groups.end(); ++git) {
+                    if ((*git)->group_name_ != subscription->token_.group) {
+                        continue;
                     }
+                    (*git)->removeSubscription(id);
+                    if ((*git)->subscriptions_.empty()) {
+                        groups.erase(git);
+                    }
+                    break;
                 }
-                if (subs.empty()) {
-                    subscriptions_by_topics_.erase(topic_it);
+                if (groups.empty()) {
+                    subscriptions_by_topics_groups_.erase(groups_it);
                 }
             }
             subscriptions_by_id_.erase(subscription_it);
