@@ -525,7 +525,7 @@ bool BrokerServer::handleSubscribe(int client_fd, std::vector<uint8_t>& frame_da
         });
         if (group != groups.end()) {
             // group exists. Add the subscription to the group
-            group->addSubscription(subscription);
+            (*group)->addSubscription(subscription);
         } else {
             // group does not exist. create a new group
             auto new_group = std::make_shared<Group>(subscribe_request.group);
