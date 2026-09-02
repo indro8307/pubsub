@@ -6,357 +6,116 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace {
-
-bool readExact(int fd, void* buf, size_t n) {
-    auto* p = static_cast<uint8_t*>(buf);
-    size_t got = 0;
-    while (got < n) {
-        const ssize_t nread = ::read(fd, p + got, n - got);
-        if (nread == 0) {
-            return false; // peer closed
-        }
-        if (nread < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        got += static_cast<size_t>(nread);
-    }
-    return true;
+Session::Session(int client_fd)
+    : client_fd_(client_fd), offset_(0) {
+    running_.store(true, std::memory_order_release);
 }
-
-bool writeExact(int fd, const void* buf, size_t n) {
-    auto* p = static_cast<const uint8_t*>(buf);
-    size_t sent = 0;
-    while (sent < n) {
-        const ssize_t nwritten = ::write(fd, p + sent, n - sent);
-        if (nwritten < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        sent += static_cast<size_t>(nwritten);
-    }
-    return true;
-}
-
-}  // namespace
-
-Session::Session(int client_fd, MessageBroker& broker)
-    : client_fd_(client_fd), broker_(broker) {}
 
 Session::~Session() {
-    requestStop();
-    join();
     if (client_fd_ >= 0) {
         ::close(client_fd_);
         client_fd_ = -1;
     }
 }
 
-void Session::start() {
-    if (reader_.joinable()) {
-        throw std::logic_error("Session::start() called while reader is already running");
-    }
-    running_.store(true, std::memory_order_release);
-    reader_ = std::thread(&Session::run, this);
-}
-
-void Session::join() {
-    if (reader_.joinable()) {
-        reader_.join();
-    }
-}
-
-void Session::requestStop() {
-    running_.store(false, std::memory_order_release);
-    if (client_fd_ >= 0) {
-        // Wake a blocking read; ignore errors if already closed.
-        ::shutdown(client_fd_, SHUT_RDWR);
-    }  
-}
-
-void Session::run() {
-    try {
-        while (running_.load(std::memory_order_acquire)) {
-            uint8_t len_buf[4];
-            if (!readExact(client_fd_, len_buf, sizeof(len_buf))) {
-                break;
-            }
-            const uint32_t frame_len =
-                (static_cast<uint32_t>(len_buf[0]) << 24) |
-                (static_cast<uint32_t>(len_buf[1]) << 16) |
-                (static_cast<uint32_t>(len_buf[2]) << 8) |
-                static_cast<uint32_t>(len_buf[3]);
-            if (frame_len < 2 || frame_len > PROTOCOL_FRAME_MAX_SIZE) {
-                break;
-            }
-
-            std::vector<uint8_t> frame(frame_len);
-            if (!readExact(client_fd_, frame.data(), frame_len)) {
-                break;
-            }
-
-            FrameHeader header;
-            decode_frame_header(header, frame);
-            if (header.version != PROTOCOL_VERSION) {
-                break;
-            }
-            handleFrame(header, frame);
-        }
-    } catch (const std::exception&) {
-        // Malformed frame or broker error: drop the connection.
-    }
-
-    cleanupSubscriptions();
-    running_.store(false, std::memory_order_release);
-}
-
-void Session::handleFrame(const FrameHeader& header, std::vector<uint8_t>& frame) {
-    switch (header.type) {
-        case ProtocolFrameType::SUBSCRIBE:
-            handleSubscribe(frame);
-            break;
-        case ProtocolFrameType::UNSUBSCRIBE:
-            handleUnsubscribe(frame);
-            break;
-        case ProtocolFrameType::PUBLISH:
-            handlePublish(frame);
-            break;
-        case ProtocolFrameType::CLOSE:
-            handleClose(frame);
-            break;
-        default:
-            // Unknown or server-only type from client: close the session.
-            running_.store(false, std::memory_order_release);
-            break;
-    }
-}
-
-void Session::deliverMessage(Deliverer* deliverer) {
-    MessageQueue* mq = deliverer->token_.mq.get();
-    while (deliverer->running_.load(std::memory_order_acquire)) {
-        std::shared_ptr<const BrokerMessage> msg;
-        bool gotMessage = mq->dequeueUntil(msg, [deliverer]() {
-            return !deliverer->running_.load(std::memory_order_acquire);
-        });
-        if (!gotMessage) {
-            continue;
-        }
-
-        if (msg) {
-            // encode the message body; sendFrame adds the frame header
-            DeliverMessage deliver_message;
-            deliver_message.subscription_id = deliverer->token_.id;
-            deliver_message.topic = deliverer->token_.topic;
-            deliver_message.sequence = msg->getSequence();
-            const Message& payload = msg->payload();
-            deliver_message.payload.assign(
-                payload.getPayload(), payload.getPayload() + payload.getSize());
-
-            std::vector<uint8_t> body;
-            encode_deliver_message(deliver_message, body);
-            sendFrame(ProtocolFrameType::DELIVER, body);
+void Session::removeSubscriptionId(uint64_t id) {
+    for (auto it = subscription_ids_.begin(); it != subscription_ids_.end(); ++it) {
+        if (*it == id) {
+            subscription_ids_.erase(it);
+            return;
         }
     }
 }
 
-void Session::handleSubscribe(std::vector<uint8_t>& frame) {
-    // decode the frame.
-    // call subscribe on the broker with the decoded topic and group.
-    // add the subscription to the map with the subscription id as the key.
-    // encode and send a subscribe ack with the request id and subscription id.
-    // Spawn a thread that will:
-    //       1. dequeue any message from the message queue for the subscription
-    //       2. encode the message as a DELIVER frame and send it to the client    
-    SubscribeRequest request;
-    decode_subscribe_request(request, frame);
+void Session::enqueueFrame(ProtocolFrameType type, const std::vector<uint8_t>& body) {
+    auto encoded_frame = std::make_shared<EncodedFrame>();
+    encoded_frame->type_ = type;
+    encoded_frame->body_ = body;
+    queue_.push_back(std::move(encoded_frame));
+}
 
-    SubscriptionToken token = broker_.subscribe(request.topic, request.group);
+FlushResult Session::flush()
+{
+    // Look at the first frame in the queue. Send the bytes that are still left:
+    // remaining = frame size - offset. If offset is 0 we are starting at the
+    // beginning of the frame.
+    //
+    // Each frame is one send()/write() call (we are not using writev). If that
+    // send finishes the whole frame, do not go back to epoll_wait yet — dequeue
+    // it and try the next frame in this same flush(). We only stop when the
+    // queue is empty or send cannot take more data right now.
+    //
+    // What send() returns:
+    //
+    // if n == requested size, the frame was sent completely. In this case we:
+    //       - dequeue the frame
+    //       - move to the next frame and repeat
+    // if the queue becomes empty after that, we are done. In this case we:
+    //       - tell the caller to drop EPOLLOUT (otherwise we keep waking up
+    //         even though there is nothing left to write)
+    //       - return
+    //
+    // if 0 < n < requested size, only part of the frame went out. In this case we:
+    //       - do not dequeue the frame
+    //       - offset += n  (so the next send starts where we left off)
+    //       - tell the caller to register EPOLLOUT
+    //       - return and wait for epoll_wait
+    //
+    // if n == -1, check errno (not every error means "try again later"):
+    //       EAGAIN / EWOULDBLOCK: the socket send buffer is full, no bytes
+    //           were written. Keep the frame and offset. Tell the caller to
+    //           register EPOLLOUT, then return and wait for epoll_wait.
+    //       EINTR: we got interrupted by a signal. Retry the same send.
+    //           Do not register EPOLLOUT.
+    //       EPIPE / ECONNRESET / any other error: the connection is dead.
+    //           Tell the caller to close it. Do not wait for EPOLLOUT.
+    //
+    // if n == 0, treat it like a dead connection (same as the fatal errors).
+    //
+    // flush() itself does not call epoll_ctl. Session / BrokerServer should
+    // add or remove EPOLLOUT based on what flush() tells it.
+
+    while (!queue_.empty())
     {
-        std::lock_guard<std::mutex> lock(subs_mtx_);
-        subscriptions_[token.id] = token;
-    }
-
-    SubscribeAck ack;
-    ack.request_id = request.request_id;
-    ack.subscription_id = token.id;
-
-    std::vector<uint8_t> body;
-    encode_subscribe_ack(ack, body);
-    sendFrame(ProtocolFrameType::SUBSCRIBE_ACK, body);
-
-    auto deliverer = std::make_unique<Deliverer>();
-    deliverer->token_ = token;
-    deliverer->running_.store(true, std::memory_order_release);
-    Deliverer* raw = deliverer.get();
-    deliverer->thread_ = std::thread(&Session::deliverMessage, this, raw);
-    {
-        std::lock_guard<std::mutex> lock(deliverers_mtx_);
-        deliverers_[token.id] = std::move(deliverer);
-    }
-
-}
-
-void Session::handleUnsubscribe(std::vector<uint8_t>& frame) {
-    // decode the frame.
-    // Find the subscription from map using the decoded subscription id.
-    // If a valid subscription is found, unsubscribe from the broker and delete the subscription from the map.
-    // Encode and send an unsubscribe ack with the subscription id.
-    UnsubscribeRequest request;
-    decode_unsubscribe_request(request, frame);
-
-    SubscriptionToken token;
-    {
-        std::lock_guard<std::mutex> lock(subs_mtx_);
-        auto it = subscriptions_.find(request.subscription_id);
-        if (it != subscriptions_.end()) {
-            token = it->second;
-            subscriptions_.erase(it);
-        }
-    }
-    if (token.valid()) {
-        // cleanup the deliverer first.
-        // find the deliverer from the map using the subscription id.
-        // set the running flag to false, wake, join, then remove from the map.
-        std::unique_ptr<Deliverer> to_stop;
+        const auto& frame = queue_.front();
+        size_t remaining = frame->body_.size() - offset_;
+        if (offset_ >= frame->body_.size() || remaining == 0)
         {
-            std::lock_guard<std::mutex> lock(deliverers_mtx_);
-            auto it = deliverers_.find(request.subscription_id);
-            if (it != deliverers_.end()) {
-                // good idea to match the SubscriptionToken found earlier with the deliverer in the map.
-                if (it->second->token_.id != token.id) {
-                    throw std::runtime_error("SubscriptionToken mismatch in deliverer map");
-                }
-                it->second->running_.store(false, std::memory_order_release);
-                it->second->token_.mq->wakeConsumers();
-                to_stop = std::move(it->second);
-                deliverers_.erase(it);
-            }
-        }
-        if (to_stop && to_stop->thread_.joinable()) {
-            to_stop->thread_.join();
-        }
-        broker_.unsubscribe(token);
-    }
-
-    UnsubscribeAck ack;
-    ack.request_id = request.request_id;
-    ack.subscription_id = request.subscription_id;
-
-    std::vector<uint8_t> body;
-    encode_unsubscribe_ack(ack, body);
-    sendFrame(ProtocolFrameType::UNSUBSCRIBE_ACK, body);
-}
-
-void Session::handlePublish(std::vector<uint8_t>& frame) {
-    // decode the frame
-    // find the subscription from map using the decoded subscription id.
-    // call publish on the broker with the decoded topic and group.
-    // encode and send a publish ack with the request id and result.
-    PublishRequest request;
-    decode_publish_request(request, frame);
-
-    Message msg(0);
-    if (!request.payload.empty()) {
-        msg.setPayload(request.payload.data(), request.payload.size());
-    }
-    const bool accepted = broker_.publish(request.topic, msg);
-
-    PublishAck ack;
-    ack.request_id = request.request_id;
-    ack.result = accepted ? PublishResult::ACCEPTED : PublishResult::NO_SUBSCRIBERS;
-
-    std::vector<uint8_t> body;
-    encode_publish_ack(ack, body);
-    sendFrame(ProtocolFrameType::PUBLISH_ACK, body);
-}
-
-void Session::handleClose(std::vector<uint8_t>& frame) {
-    // decode the frame
-    // cleanup the subscriptions
-    // encode and send a close ack with the request id.
-    // set the running flag to false.
-    CloseRequest request;
-    decode_close_request(request, frame);
-
-    cleanupSubscriptions();
-
-    CloseAck ack;
-    ack.request_id = request.request_id;
-
-    std::vector<uint8_t> body;
-    encode_close_ack(ack, body);
-    sendFrame(ProtocolFrameType::CLOSE_ACK, body);
-
-    running_.store(false, std::memory_order_release);
-}
-
-void Session::cleanupSubscriptions() {
-    // Stop and join deliverers first so threads are not joinable when the map dies.
-    std::map<uint64_t, std::unique_ptr<Deliverer>> deliverers_to_stop;
-    {
-        std::lock_guard<std::mutex> lock(deliverers_mtx_);
-        deliverers_to_stop.swap(deliverers_);
-    }
-    for (auto& [id, deliverer] : deliverers_to_stop) {
-        (void)id;
-        if (!deliverer) {
+            queue_.erase(queue_.begin());
+            offset_ = 0;
             continue;
         }
-        deliverer->running_.store(false, std::memory_order_release);
-        if (deliverer->token_.mq) {
-            deliverer->token_.mq->wakeConsumers();
+        ssize_t n = send(client_fd_, frame->body_.data() + offset_, remaining, MSG_NOSIGNAL|MSG_DONTWAIT);
+        if (n == -1)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                return FlushResult::FLUSH_EPOLLOUT;
+            }
+            else
+            {
+                queue_.clear();
+                return FlushResult::FLUSH_CLOSE;
+            }
+        }
+        else if (n == 0)
+        {
+            queue_.clear();
+            return FlushResult::FLUSH_CLOSE;
+        }
+        else
+        {
+            offset_ += n;
+            if (offset_ == frame->body_.size())
+            {
+                queue_.erase(queue_.begin());
+                offset_ = 0;
+            }
+            else
+            {
+                return FlushResult::FLUSH_EPOLLOUT;
+            }
         }
     }
-    for (auto& [id, deliverer] : deliverers_to_stop) {
-        (void)id;
-        if (deliverer && deliverer->thread_.joinable()) {
-            deliverer->thread_.join();
-        }
-    }
-
-    // Move subscriptions out under the lock, then unsubscribe outside it.
-    // swap is O(1) and leaves subscriptions_ empty so we don't hold
-    // subs_mtx_ across broker_.unsubscribe() (which takes its own locks).
-    std::map<uint64_t, SubscriptionToken> to_remove;
-    {
-        std::lock_guard<std::mutex> lock(subs_mtx_);
-        to_remove.swap(subscriptions_);
-    }
-    for (auto& [id, token] : to_remove) {
-        (void)id;
-        if (token.valid()) {
-            broker_.unsubscribe(token);
-        }
-    }
-}
-
-void Session::sendFrame(ProtocolFrameType type, const std::vector<uint8_t>& body) {
-    FrameHeader header;
-    header.version = PROTOCOL_VERSION;
-    header.type = type;
-
-    std::vector<uint8_t> frame;
-    encode_frame_header(header, frame);
-    frame.insert(frame.end(), body.begin(), body.end());   // copy 1 
-
-    if (frame.size() > PROTOCOL_FRAME_MAX_SIZE) {
-        throw std::runtime_error("Outbound frame exceeds PROTOCOL_FRAME_MAX_SIZE");
-    }
-
-    std::vector<uint8_t> wire;
-    encode_u32(static_cast<uint32_t>(frame.size()), wire);
-    wire.insert(wire.end(), frame.begin(), frame.end());   // copy 2 copy from frame to wire.
-
-    std::lock_guard<std::mutex> lock(write_mtx_);
-    if (client_fd_ < 0) {
-        return;
-    }
-    if (!writeExact(client_fd_, wire.data(), wire.size())) {
-        running_.store(false, std::memory_order_release);
-    }
-}
+    return FlushResult::FLUSH_SUCCESS;
+}    

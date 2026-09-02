@@ -62,7 +62,7 @@ void FanoutDispatcher::unsubscribe(const SubscriptionToken& token) {
     bro.unsubscribe(token);
 }
 
-NetworkDispatcher::NetworkDispatcher(const std::string& host, int port) : broker_client_(host, port) {
+NetworkDispatcher::NetworkDispatcher(const std::string& host, int port, NetworkDispatcherType type) : broker_client_(host, port), type_(type) {
     broker_client_.setDeliverMessageHandler(
         [this](const DeliverMessage& message) { handle_deliver_message(message); });
     broker_client_.setSubscribeAckHandler(
@@ -155,9 +155,16 @@ SubscriptionToken NetworkDispatcher::subscribe(const std::string& topic) {
     SubscribeRequest subscribe_request;
     subscribe_request.request_id = broker_client_.generateRequestId();
     subscribe_request.topic = topic;
-    // Fan-out: unique group per subscriber (UUID so uniqueness holds across
-    // processes and hosts). Distinct from the broker-assigned subscription_id.
-    subscribe_request.group = topic + "_sub_" + randomUuidV4();
+    if (type_ == NetworkDispatcherType::FANOUT) {
+        // Fan-out: unique group per subscriber (UUID so uniqueness holds across
+        // processes and hosts). Distinct from the broker-assigned subscription_id.
+        subscribe_request.group = topic + "_sub_" + randomUuidV4();
+    } else if (type_ == NetworkDispatcherType::COMPETE_CONSUMER) {
+        // Compete consumer: use the topic name as the group name.
+        subscribe_request.group = topic;
+    } else {
+        throw std::runtime_error("Invalid network dispatcher type");
+    }
     encode_subscribe_request(subscribe_request, frame_buffer);
 
     // Pre-create the queue and register as pending by request_id so the

@@ -7,12 +7,15 @@
 #include "protocol_frame.h"
 #include "test_helpers.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -229,13 +232,13 @@ TEST(NetworkTests, ClientConnectsToServer) {
     ASSERT_EQ(sessions.size(), 1u);
     ASSERT_NE(sessions[0], nullptr);
     EXPECT_TRUE(sessions[0]->isRunning());
-    EXPECT_EQ(sessions[0]->delivererCount(), 0u);
+    EXPECT_EQ(broker.subscriptionCount(), 0u);
 
     client.stop();
     server.stop();
 }
 
-TEST(NetworkTests, SubscribeReturnsTokenAndCreatesDeliverer) {
+TEST(NetworkTests, SubscribeReturnsTokenAndRegistersOnBroker) {
     const uint16_t port = testPort();
 
     MessageBroker broker;
@@ -246,7 +249,6 @@ TEST(NetworkTests, SubscribeReturnsTokenAndCreatesDeliverer) {
     NetworkDispatcher dispatcher(kHost, static_cast<int>(port));
     ASSERT_TRUE(waitForOneRunningSession(server));
 
-    EXPECT_EQ(server.sessions()[0]->delivererCount(), 0u);
     EXPECT_EQ(broker.subscriptionCount(), 0u);
 
     SubscriptionToken token = dispatcher.subscribe(kTopic);
@@ -259,13 +261,8 @@ TEST(NetworkTests, SubscribeReturnsTokenAndCreatesDeliverer) {
     EXPECT_TRUE(dispatcher.hasSubscription(token.id));
 
     ASSERT_TRUE(waitUntil(
-        [&] {
-            const auto sessions = server.sessions();
-            return sessions.size() == 1 && sessions[0] &&
-                   sessions[0]->delivererCount() == 1;
-        },
+        [&] { return broker.subscriptionCount() == 1; },
         2s));
-    EXPECT_EQ(server.sessions()[0]->delivererCount(), 1u);
 
     dispatcher.unsubscribe(token);
     server.stop();
@@ -286,7 +283,7 @@ TEST(NetworkTests, PublishAfterSubscribeDeliversToClient) {
     SubscriptionToken token = dispatcher.subscribe(kTopic);
     ASSERT_TRUE(token.valid());
     ASSERT_TRUE(waitUntil(
-        [&] { return server.sessions()[0]->delivererCount() == 1; }, 2s));
+        [&] { return broker.subscriptionCount() == 1; }, 2s));
 
     dispatcher.publish(kTopic, /*id=*/7, payload);
 
@@ -301,7 +298,7 @@ TEST(NetworkTests, PublishAfterSubscribeDeliversToClient) {
     server.stop();
 }
 
-TEST(NetworkTests, UnsubscribeStopsDelivererAndDropsBrokerSub) {
+TEST(NetworkTests, UnsubscribeDropsBrokerSubAndStopsDelivery) {
     const uint16_t port = testPort();
 
     MessageBroker broker;
@@ -315,20 +312,14 @@ TEST(NetworkTests, UnsubscribeStopsDelivererAndDropsBrokerSub) {
     SubscriptionToken token = subscriber.subscribe(kTopic);
     ASSERT_TRUE(token.valid());
     ASSERT_TRUE(waitUntil(
-        [&] {
-            return broker.subscriptionCount() == 1 &&
-                   server.sessions()[0]->delivererCount() == 1;
-        },
+        [&] { return broker.subscriptionCount() == 1; },
         2s));
 
     const uint64_t subscription_id = token.id;
     subscriber.unsubscribe(token);
 
     ASSERT_TRUE(waitUntil(
-        [&] {
-            return broker.subscriptionCount() == 0 &&
-                   server.sessions()[0]->delivererCount() == 0;
-        },
+        [&] { return broker.subscriptionCount() == 0; },
         2s));
     EXPECT_FALSE(subscriber.hasSubscription(subscription_id));
 
@@ -410,9 +401,7 @@ TEST(NetworkTests, ClientDisconnectCleansServerSubscriptions) {
         SubscriptionToken token = dispatcher.subscribe(kTopic);
         ASSERT_TRUE(token.valid());
         ASSERT_TRUE(waitUntil(
-            [&] {
-                return broker.subscriptionCount() == 1 && session->delivererCount() == 1;
-            },
+            [&] { return broker.subscriptionCount() == 1; },
             2s));
         // Destructor stops BrokerClient without sending UNSUBSCRIBE.
     }
@@ -420,11 +409,9 @@ TEST(NetworkTests, ClientDisconnectCleansServerSubscriptions) {
     ASSERT_TRUE(waitUntil([&] { return broker.subscriptionCount() == 0; }, 2s))
         << "Broker still has subscriptions after client disconnect";
     ASSERT_TRUE(waitUntil(
-        [&] {
-            return session && !session->isRunning() && session->delivererCount() == 0;
-        },
+        [&] { return session && !session->isRunning(); },
         2s))
-        << "Session did not finish / join deliverers after client disconnect";
+        << "Session did not finish after client disconnect";
 
     server.stop();
 }
@@ -451,7 +438,7 @@ TEST(NetworkTests, CloseFrameAcksAndTearsDownSession) {
     ASSERT_EQ(sub_ack->type, ProtocolFrameType::SUBSCRIBE_ACK);
     ASSERT_NE(sub_ack->subscribe_ack.subscription_id, 0u);
     ASSERT_TRUE(waitUntil(
-        [&] { return broker.subscriptionCount() == 1 && session->delivererCount() == 1; },
+        [&] { return broker.subscriptionCount() == 1; },
         2s));
 
     const uint32_t close_req = client.generateRequestId();
@@ -461,10 +448,7 @@ TEST(NetworkTests, CloseFrameAcksAndTearsDownSession) {
     EXPECT_EQ(close_ack->close_ack.request_id, close_req);
 
     ASSERT_TRUE(waitUntil(
-        [&] {
-            return !session->isRunning() && broker.subscriptionCount() == 0 &&
-                   session->delivererCount() == 0;
-        },
+        [&] { return !session->isRunning() && broker.subscriptionCount() == 0; },
         2s))
         << "CLOSE did not tear down session / subscriptions";
 
@@ -493,40 +477,6 @@ TEST(NetworkTests, NetworkDispatcherDestructorStopsClient) {
         << "Session still running after NetworkDispatcher destruction";
 
     // Must complete without deadlock once the client is gone.
-    server.stop();
-}
-
-// D3 — Session reader exit (requestStop) joins deliverers and unsubscribes on broker.
-TEST(NetworkTests, ReaderExitRunsCleanupSubscriptions) {
-    const uint16_t port = testPort();
-
-    MessageBroker broker;
-    BrokerServer server(broker, port);
-    server.start();
-    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
-
-    NetworkDispatcher dispatcher(kHost, static_cast<int>(port));
-    ASSERT_TRUE(waitForOneRunningSession(server));
-    auto session = server.sessions()[0];
-
-    SubscriptionToken token = dispatcher.subscribe(kTopic);
-    ASSERT_TRUE(token.valid());
-    ASSERT_TRUE(waitUntil(
-        [&] {
-            return broker.subscriptionCount() == 1 && session->delivererCount() == 1;
-        },
-        2s));
-
-    session->requestStop();
-
-    ASSERT_TRUE(waitUntil(
-        [&] {
-            return !session->isRunning() && broker.subscriptionCount() == 0 &&
-                   session->delivererCount() == 0;
-        },
-        2s))
-        << "requestStop did not clean deliverers / broker subscriptions";
-
     server.stop();
 }
 
@@ -632,50 +582,6 @@ TEST(NetworkTests, SubscribeAckHandlerRunsBeforePromise) {
     server.stop();
 }
 
-// G2 — failed subscribe clears pending_by_request_id_ (no leak).
-// Without a pendingCount() hook, assert the failure path itself: subscribe must
-// throw after disconnect, and a fresh dispatcher can still subscribe successfully.
-// Inspect NetworkDispatcher::pending_by_request_id_ after the throw to confirm leak.
-TEST(NetworkTests, SubscribeFailureClearsPendingMap) {
-    const uint16_t port = testPort();
-
-    MessageBroker broker;
-    BrokerServer server(broker, port);
-    server.start();
-    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
-
-    NetworkDispatcher dispatcher(kHost, static_cast<int>(port));
-    ASSERT_TRUE(waitForOneRunningSession(server));
-    auto session = server.sessions()[0];
-
-    session->requestStop();
-    ASSERT_TRUE(waitUntil([&] { return session && !session->isRunning(); }, 2s));
-    // Allow the client receive thread to observe EOF and clear connected_.
-    std::this_thread::sleep_for(100ms);
-
-    // Breakpoint / watch pending_by_request_id_ here after the throw:
-    // insert happens before sendFrame; on send/get failure the map entry is leaked
-    // unless subscribe() clears it in a catch.
-    EXPECT_THROW(dispatcher.subscribe(kTopic), std::runtime_error);
-
-    server.stop();
-
-    // Retry on a fresh connection still works (no sticky process-wide corruption).
-    const uint16_t port2 = static_cast<uint16_t>(port + 1);
-    MessageBroker broker2;
-    BrokerServer server2(broker2, port2);
-    server2.start();
-    ASSERT_TRUE(waitUntil([&] { return server2.isListening(); }, 2s));
-
-    NetworkDispatcher dispatcher2(kHost, static_cast<int>(port2));
-    ASSERT_TRUE(waitForOneRunningSession(server2));
-    SubscriptionToken token = dispatcher2.subscribe(kTopic);
-    ASSERT_TRUE(token.valid());
-    EXPECT_TRUE(dispatcher2.hasSubscription(token.id));
-
-    server2.stop();
-}
-
 // B7 — DELIVER that races SUBSCRIBE_ACK is not dropped (map registered first).
 TEST(NetworkTests, ImmediatePublishAfterSubscribeDoesNotDropFirstDeliver) {
     const uint16_t port = testPort();
@@ -731,10 +637,11 @@ TEST(NetworkTests, ImmediatePublishAfterSubscribeDoesNotDropFirstDeliver) {
 // F1 — MalformedFrameDropsSessionOnly
 //
 // Purpose: A single bad length-prefixed frame must end that Session only. The
-// accept loop stays healthy so a later well-behaved client can still connect.
+// epoll reactor stays healthy so a later well-behaved client can still connect.
 //
 // Action: raw TCP client sends frame_len == 1 (< minimum header size of 2).
-// Session::run breaks out of the reader loop, cleans up, and sets !isRunning().
+// BrokerServer::handleClientReadable rejects it, closeClient runs, and the
+// Session is marked !isRunning().
 //
 TEST(NetworkTests, MalformedFrameDropsSessionOnly) {
     const uint16_t port = testPort();
@@ -749,7 +656,8 @@ TEST(NetworkTests, MalformedFrameDropsSessionOnly) {
     ASSERT_TRUE(waitForOneRunningSession(server));
     auto bad_session = server.sessions()[0];
 
-    // frame_len = 1 → rejected by Session::run (needs at least 2-byte header).
+    // frame_len = 1 → rejected by the epoll readable path (needs at least a
+    // 2-byte frame header after the length prefix).
     std::vector<uint8_t> bad_len;
     encode_u32(1u, bad_len);
     ASSERT_TRUE(writeAll(bad_fd, bad_len.data(), bad_len.size()));
@@ -764,7 +672,7 @@ TEST(NetworkTests, MalformedFrameDropsSessionOnly) {
     good.start();
     ASSERT_TRUE(waitUntil([&] { return good.isConnected(); }, 2s));
     ASSERT_TRUE(waitForRunningSessionCount(server, 1))
-        << "Server accept loop unhealthy after malformed-frame session";
+        << "Server reactor unhealthy after malformed-frame session";
 
     good.stop();
     server.stop();
@@ -812,8 +720,9 @@ TEST(NetworkTests, UnsupportedProtocolVersionDropsSession) {
 // F5 — ManySubscriptionsPerSession
 //
 // Purpose: One NetworkDispatcher / Session can hold multiple subscriptions
-// (each with its own deliverer). Unsubscribing one must not tear down the
-// others' deliverers or broker registrations.
+// (multiplexed on one TCP connection; server tracks them in its sub indexes /
+// session subscription-id list). Unsubscribing one must not tear down the
+// others' broker registrations or local client queues.
 //
 TEST(NetworkTests, ManySubscriptionsPerSession) {
     const uint16_t port = testPort();
@@ -830,7 +739,6 @@ TEST(NetworkTests, ManySubscriptionsPerSession) {
 
     NetworkDispatcher subscriber(kHost, static_cast<int>(port));
     ASSERT_TRUE(waitForOneRunningSession(server));
-    auto session = server.sessions()[0];
 
     SubscriptionToken token_a = subscriber.subscribe(topic_a);
     SubscriptionToken token_b = subscriber.subscribe(topic_b);
@@ -842,9 +750,7 @@ TEST(NetworkTests, ManySubscriptionsPerSession) {
     ASSERT_NE(token_b.id, token_c.id);
 
     ASSERT_TRUE(waitUntil(
-        [&] {
-            return broker.subscriptionCount() == 3 && session->delivererCount() == 3;
-        },
+        [&] { return broker.subscriptionCount() == 3; },
         2s));
     EXPECT_TRUE(subscriber.hasSubscription(token_a.id));
     EXPECT_TRUE(subscriber.hasSubscription(token_b.id));
@@ -853,11 +759,9 @@ TEST(NetworkTests, ManySubscriptionsPerSession) {
     subscriber.unsubscribe(token_b);
 
     ASSERT_TRUE(waitUntil(
-        [&] {
-            return broker.subscriptionCount() == 2 && session->delivererCount() == 2;
-        },
+        [&] { return broker.subscriptionCount() == 2; },
         2s))
-        << "Unsubscribe of one sub did not leave the other deliverers";
+        << "Unsubscribe of one sub did not leave the other subscriptions";
     EXPECT_TRUE(subscriber.hasSubscription(token_a.id));
     EXPECT_FALSE(subscriber.hasSubscription(token_b.id));
     EXPECT_TRUE(subscriber.hasSubscription(token_c.id));
@@ -887,11 +791,12 @@ TEST(NetworkTests, ManySubscriptionsPerSession) {
 // Network stress — 50 NetworkDispatchers shared by 100 fan-out subscribers
 // (2 subscribe()s each) and 50 publisher threads × 100 messages on one topic.
 //
-// Publishes are serialized so every subscriber must see the same broker
-// sequence order (concurrent publish can reorder fan-out enqueues today).
+// Publishes run concurrently (no global publish lock). Each subscriber must
+// receive every message with strictly increasing sequences; cross-subscriber
+// delivery order is not required to match.
 // Dispatchers are reused for both subscribe and publish (multiplexed sessions).
 //
-TEST(NetworkStress, FiftyDispatchers_HundredSubs_SerializedPublishOrder) {
+TEST(NetworkStress, FiftyDispatchers_HundredSubs_ConcurrentPublish) {
     constexpr int kDispatchers = 50;
     constexpr int kSubsPerDispatcher = 2;
     constexpr int kSubscribers = kDispatchers * kSubsPerDispatcher;  // 100
@@ -952,8 +857,6 @@ TEST(NetworkStress, FiftyDispatchers_HundredSubs_SerializedPublishOrder) {
         });
     }
 
-    // One publish at a time across all publisher threads → identical fan-out order.
-    std::mutex publish_mu;
     std::atomic<bool> publish_ok{true};
     std::vector<std::thread> publishers;
     publishers.reserve(static_cast<size_t>(kPublishers));
@@ -963,7 +866,6 @@ TEST(NetworkStress, FiftyDispatchers_HundredSubs_SerializedPublishOrder) {
                 *dispatchers[static_cast<size_t>(pubIdx % kDispatchers)];
             try {
                 for (int msgIdx = 0; msgIdx < kMessagesPerPublisher; ++msgIdx) {
-                    std::lock_guard<std::mutex> lock(publish_mu);
                     dispatcher.publish(
                         topic,
                         /*id=*/msgIdx,
@@ -988,21 +890,429 @@ TEST(NetworkStress, FiftyDispatchers_HundredSubs_SerializedPublishOrder) {
         ASSERT_EQ(sequences[static_cast<size_t>(i)].size(),
                   static_cast<size_t>(kTotalMessages))
             << "subscriber " << i << " incomplete (dequeue timeout?)";
-    }
-
-    const std::vector<uint64_t>& reference = sequences[0];
-    for (size_t i = 1; i < reference.size(); ++i) {
-        EXPECT_LT(reference[i - 1], reference[i])
-            << "reference sequences not strictly increasing at index " << i;
-    }
-    for (int i = 1; i < kSubscribers; ++i) {
-        EXPECT_EQ(sequences[static_cast<size_t>(i)], reference)
-            << "subscriber " << i << " saw a different order/set than subscriber 0";
+        const auto& seqs = sequences[static_cast<size_t>(i)];
+        for (size_t j = 1; j < seqs.size(); ++j) {
+            EXPECT_LT(seqs[j - 1], seqs[j])
+                << "subscriber " << i << " sequences not strictly increasing at index " << j;
+        }
     }
 
     for (size_t i = 0; i < tokens.size(); ++i) {
         dispatchers[i / static_cast<size_t>(kSubsPerDispatcher)]->unsubscribe(tokens[i]);
     }
+    server.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Network compete-consumer MVP (one dispatcher per worker; sync single publisher)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<uint64_t> drainSequences(const SubscriptionToken& token,
+                                     size_t expected,
+                                     std::chrono::milliseconds per_msg_timeout = 2s) {
+    std::vector<uint64_t> seqs;
+    seqs.reserve(expected);
+    for (size_t i = 0; i < expected; ++i) {
+        std::shared_ptr<const BrokerMessage> msg;
+        if (!token.mq->dequeueFor(msg, per_msg_timeout) || !msg) {
+            break;
+        }
+        seqs.push_back(msg->getSequence());
+    }
+    return seqs;
+}
+
+bool noExtraMessage(const SubscriptionToken& token,
+                    std::chrono::milliseconds timeout = 30ms) {
+    std::shared_ptr<const BrokerMessage> msg;
+    return !token.mq->dequeueFor(msg, timeout);
+}
+
+SubscriptionToken connectAndSubscribeCompete(
+    BrokerServer& server,
+    std::vector<std::unique_ptr<NetworkDispatcher>>& workers,
+    uint16_t port,
+    const char* topic,
+    size_t expected_sessions) {
+    workers.push_back(std::make_unique<NetworkDispatcher>(
+        kHost, static_cast<int>(port), NetworkDispatcherType::COMPETE_CONSUMER));
+    if (!waitForSessionCount(server, expected_sessions)) {
+        throw std::runtime_error("timed out waiting for compete worker session");
+    }
+    return workers.back()->subscribe(topic);
+}
+
+}  // namespace
+
+TEST(NetworkCompeteTests, FiveSubsFiveMsgs_OneEachRoundRobin) {
+    const uint16_t port = testPort();
+    constexpr int kSubs = 5;
+    constexpr int kMsgs = 5;
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    std::vector<std::unique_ptr<NetworkDispatcher>> workers;
+    std::vector<SubscriptionToken> tokens;
+    workers.reserve(static_cast<size_t>(kSubs));
+    tokens.reserve(static_cast<size_t>(kSubs));
+    for (int i = 0; i < kSubs; ++i) {
+        tokens.push_back(connectAndSubscribeCompete(
+            server, workers, port, kTopic, static_cast<size_t>(i + 1)));
+        ASSERT_TRUE(tokens.back().valid());
+        EXPECT_EQ(tokens.back().group, kTopic);
+    }
+    ASSERT_TRUE(waitUntil(
+        [&] {
+            return broker.subscriptionCount() == static_cast<size_t>(kSubs) &&
+                   broker.groupCount(kTopic) == 1;
+        },
+        2s));
+
+    NetworkDispatcher publisher(kHost, static_cast<int>(port));
+    ASSERT_TRUE(waitForSessionCount(server, static_cast<size_t>(kSubs + 1)));
+    for (int i = 0; i < kMsgs; ++i) {
+        publisher.publish(kTopic, /*id=*/i, "m" + std::to_string(i));
+    }
+
+    std::set<uint64_t> all_seqs;
+    for (int i = 0; i < kSubs; ++i) {
+        auto seqs = drainSequences(tokens[static_cast<size_t>(i)], /*expected=*/1);
+        ASSERT_EQ(seqs.size(), 1u) << "worker " << i;
+        EXPECT_EQ(seqs[0], static_cast<uint64_t>(i + 1))
+            << "RR expects worker " << i << " to get sequence " << (i + 1);
+        all_seqs.insert(seqs[0]);
+        EXPECT_TRUE(noExtraMessage(tokens[static_cast<size_t>(i)])) << "worker " << i;
+    }
+    EXPECT_EQ(all_seqs.size(), static_cast<size_t>(kMsgs));
+
+    for (int i = 0; i < kSubs; ++i) {
+        workers[static_cast<size_t>(i)]->unsubscribe(tokens[static_cast<size_t>(i)]);
+    }
+    server.stop();
+}
+
+TEST(NetworkCompeteTests, FiveSubsEightMsgs_UnevenCounts) {
+    const uint16_t port = testPort();
+    constexpr int kSubs = 5;
+    constexpr int kMsgs = 8;
+    const int expected_counts[kSubs] = {2, 2, 2, 1, 1};
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    std::vector<std::unique_ptr<NetworkDispatcher>> workers;
+    std::vector<SubscriptionToken> tokens;
+    for (int i = 0; i < kSubs; ++i) {
+        tokens.push_back(connectAndSubscribeCompete(
+            server, workers, port, kTopic, static_cast<size_t>(i + 1)));
+        ASSERT_TRUE(tokens.back().valid());
+    }
+    ASSERT_TRUE(waitUntil(
+        [&] { return broker.subscriptionCount() == static_cast<size_t>(kSubs); }, 2s));
+
+    NetworkDispatcher publisher(kHost, static_cast<int>(port));
+    ASSERT_TRUE(waitForSessionCount(server, static_cast<size_t>(kSubs + 1)));
+    for (int i = 0; i < kMsgs; ++i) {
+        publisher.publish(kTopic, /*id=*/i, "m" + std::to_string(i));
+    }
+
+    std::set<uint64_t> all_seqs;
+    for (int i = 0; i < kSubs; ++i) {
+        const size_t want = static_cast<size_t>(expected_counts[i]);
+        auto seqs = drainSequences(tokens[static_cast<size_t>(i)], want);
+        ASSERT_EQ(seqs.size(), want) << "worker " << i;
+        for (uint64_t s : seqs) {
+            EXPECT_TRUE(all_seqs.insert(s).second) << "duplicate sequence " << s;
+        }
+        EXPECT_TRUE(noExtraMessage(tokens[static_cast<size_t>(i)])) << "worker " << i;
+    }
+    EXPECT_EQ(all_seqs.size(), static_cast<size_t>(kMsgs));
+
+    for (int i = 0; i < kSubs; ++i) {
+        workers[static_cast<size_t>(i)]->unsubscribe(tokens[static_cast<size_t>(i)]);
+    }
+    server.stop();
+}
+
+TEST(NetworkCompeteTests, PublishWithZeroSubscribers) {
+    const uint16_t port = testPort();
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    NetworkDispatcher publisher(kHost, static_cast<int>(port));
+    ASSERT_TRUE(waitForOneRunningSession(server));
+    EXPECT_EQ(broker.subscriptionCount(), 0u);
+
+    EXPECT_NO_THROW(publisher.publish(kTopic, /*id=*/1, "nobody-home"));
+    EXPECT_EQ(broker.subscriptionCount(), 0u);
+
+    server.stop();
+}
+
+TEST(NetworkCompeteTests, FanoutAndCompeteSameTopic) {
+    const uint16_t port = testPort();
+    constexpr int kCompete = 2;
+    constexpr int kMsgs = 4;
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    NetworkDispatcher fanout(kHost, static_cast<int>(port), NetworkDispatcherType::FANOUT);
+    ASSERT_TRUE(waitForOneRunningSession(server));
+    SubscriptionToken fanout_token = fanout.subscribe(kTopic);
+    ASSERT_TRUE(fanout_token.valid());
+
+    std::vector<std::unique_ptr<NetworkDispatcher>> compete;
+    std::vector<SubscriptionToken> compete_tokens;
+    for (int i = 0; i < kCompete; ++i) {
+        compete_tokens.push_back(connectAndSubscribeCompete(
+            server, compete, port, kTopic, static_cast<size_t>(2 + i)));
+        ASSERT_TRUE(compete_tokens.back().valid());
+        EXPECT_EQ(compete_tokens.back().group, kTopic);
+        EXPECT_NE(compete_tokens.back().group, fanout_token.group);
+    }
+
+    ASSERT_TRUE(waitUntil(
+        [&] {
+            return broker.subscriptionCount() == static_cast<size_t>(1 + kCompete) &&
+                   broker.groupCount(kTopic) == 2;
+        },
+        2s));
+
+    NetworkDispatcher publisher(kHost, static_cast<int>(port));
+    ASSERT_TRUE(waitForSessionCount(server, static_cast<size_t>(2 + kCompete)));
+    for (int i = 0; i < kMsgs; ++i) {
+        publisher.publish(kTopic, /*id=*/i, "both-" + std::to_string(i));
+    }
+
+    auto fanout_seqs = drainSequences(fanout_token, static_cast<size_t>(kMsgs));
+    ASSERT_EQ(fanout_seqs.size(), static_cast<size_t>(kMsgs));
+    EXPECT_TRUE(noExtraMessage(fanout_token));
+
+    std::set<uint64_t> compete_seqs;
+    for (int i = 0; i < kCompete; ++i) {
+        // RR with 2 workers and 4 msgs → 2 each.
+        auto seqs = drainSequences(compete_tokens[static_cast<size_t>(i)], /*expected=*/2);
+        ASSERT_EQ(seqs.size(), 2u) << "compete worker " << i;
+        for (uint64_t s : seqs) {
+            EXPECT_TRUE(compete_seqs.insert(s).second) << "compete duplicate " << s;
+        }
+        EXPECT_TRUE(noExtraMessage(compete_tokens[static_cast<size_t>(i)]));
+    }
+    EXPECT_EQ(compete_seqs.size(), static_cast<size_t>(kMsgs));
+
+    std::set<uint64_t> fanout_set(fanout_seqs.begin(), fanout_seqs.end());
+    EXPECT_EQ(fanout_set, compete_seqs);
+
+    fanout.unsubscribe(fanout_token);
+    for (int i = 0; i < kCompete; ++i) {
+        compete[static_cast<size_t>(i)]->unsubscribe(compete_tokens[static_cast<size_t>(i)]);
+    }
+    server.stop();
+}
+
+TEST(NetworkCompeteTests, UnsubscribeMidStream_NoLostAcceptedSequences) {
+    const uint16_t port = testPort();
+    constexpr int kSubs = 4;
+    constexpr int kBeforeUnsub = 4;
+    constexpr int kAfterUnsub = 4;
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    std::vector<std::unique_ptr<NetworkDispatcher>> workers;
+    std::vector<SubscriptionToken> tokens;
+    for (int i = 0; i < kSubs; ++i) {
+        tokens.push_back(connectAndSubscribeCompete(
+            server, workers, port, kTopic, static_cast<size_t>(i + 1)));
+        ASSERT_TRUE(tokens.back().valid());
+    }
+    ASSERT_TRUE(waitUntil(
+        [&] { return broker.subscriptionCount() == static_cast<size_t>(kSubs); }, 2s));
+
+    NetworkDispatcher publisher(kHost, static_cast<int>(port));
+    ASSERT_TRUE(waitForSessionCount(server, static_cast<size_t>(kSubs + 1)));
+    for (int i = 0; i < kBeforeUnsub; ++i) {
+        publisher.publish(kTopic, /*id=*/i, "pre-" + std::to_string(i));
+    }
+
+    // Wait until the first round has landed locally before tearing anyone down,
+    // so in-flight DELIVERs are not dropped by unsubscribe.
+    std::set<uint64_t> all_seqs;
+    for (int i = 0; i < kSubs; ++i) {
+        auto seqs = drainSequences(tokens[static_cast<size_t>(i)], /*expected=*/1);
+        ASSERT_EQ(seqs.size(), 1u) << "worker " << i << " missed pre-unsub message";
+        EXPECT_TRUE(all_seqs.insert(seqs[0]).second);
+    }
+    EXPECT_EQ(all_seqs.size(), static_cast<size_t>(kBeforeUnsub));
+
+    // Drop workers 2 and 3; remaining RR continues on workers 0 and 1.
+    workers[2]->unsubscribe(tokens[2]);
+    workers[3]->unsubscribe(tokens[3]);
+    ASSERT_TRUE(waitUntil([&] { return broker.subscriptionCount() == 2; }, 2s));
+
+    for (int i = 0; i < kAfterUnsub; ++i) {
+        publisher.publish(kTopic, /*id=*/100 + i, "post-" + std::to_string(i));
+    }
+
+    // After unsub of 2/3: four more → 0,1,0,1 (2 each for remaining workers).
+    for (int i = 0; i < 2; ++i) {
+        auto seqs = drainSequences(tokens[static_cast<size_t>(i)], /*expected=*/2);
+        ASSERT_EQ(seqs.size(), 2u) << "worker " << i;
+        for (uint64_t s : seqs) {
+            EXPECT_TRUE(all_seqs.insert(s).second) << "duplicate sequence " << s;
+        }
+        EXPECT_TRUE(noExtraMessage(tokens[static_cast<size_t>(i)])) << "worker " << i;
+    }
+    EXPECT_TRUE(noExtraMessage(tokens[2]));
+    EXPECT_TRUE(noExtraMessage(tokens[3]));
+    EXPECT_EQ(all_seqs.size(), static_cast<size_t>(kBeforeUnsub + kAfterUnsub));
+
+    workers[0]->unsubscribe(tokens[0]);
+    workers[1]->unsubscribe(tokens[1]);
+    server.stop();
+}
+
+TEST(NetworkCompeteTests, LateJoinReceivesMessages) {
+    const uint16_t port = testPort();
+    constexpr int kInitial = 4;
+    constexpr int kWarmup = 2;
+    constexpr int kAfterJoin = 20;
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    std::vector<std::unique_ptr<NetworkDispatcher>> workers;
+    std::vector<SubscriptionToken> tokens;
+    for (int i = 0; i < kInitial; ++i) {
+        tokens.push_back(connectAndSubscribeCompete(
+            server, workers, port, kTopic, static_cast<size_t>(i + 1)));
+        ASSERT_TRUE(tokens.back().valid());
+    }
+    ASSERT_TRUE(waitUntil(
+        [&] { return broker.subscriptionCount() == static_cast<size_t>(kInitial); }, 2s));
+
+    NetworkDispatcher publisher(kHost, static_cast<int>(port));
+    ASSERT_TRUE(waitForSessionCount(server, static_cast<size_t>(kInitial + 1)));
+    for (int i = 0; i < kWarmup; ++i) {
+        publisher.publish(kTopic, /*id=*/i, "warm-" + std::to_string(i));
+    }
+
+    tokens.push_back(connectAndSubscribeCompete(
+        server, workers, port, kTopic, static_cast<size_t>(kInitial + 2)));
+    ASSERT_TRUE(tokens.back().valid());
+    ASSERT_TRUE(waitUntil(
+        [&] { return broker.subscriptionCount() == static_cast<size_t>(kInitial + 1); },
+        2s));
+
+    for (int i = 0; i < kAfterJoin; ++i) {
+        publisher.publish(kTopic, /*id=*/100 + i, "late-" + std::to_string(i));
+    }
+
+    auto late_seqs = drainSequences(tokens.back(), /*expected=*/1, 3s);
+    ASSERT_EQ(late_seqs.size(), 1u) << "late joiner never received a message";
+
+    // Drain remaining deliveries so queues don't back up during unsubscribe.
+    const int total_msgs = kWarmup + kAfterJoin;
+    std::set<uint64_t> all_seqs(late_seqs.begin(), late_seqs.end());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        while (true) {
+            std::shared_ptr<const BrokerMessage> msg;
+            if (!tokens[i].mq->dequeueFor(msg, 100ms) || !msg) {
+                break;
+            }
+            all_seqs.insert(msg->getSequence());
+        }
+    }
+    EXPECT_EQ(all_seqs.size(), static_cast<size_t>(total_msgs));
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        workers[i]->unsubscribe(tokens[i]);
+    }
+    server.stop();
+}
+
+TEST(NetworkCompeteTests, MultiConnectionCloseCleanup) {
+    const uint16_t port = testPort();
+
+    MessageBroker broker;
+    BrokerServer server(broker, port);
+    server.start();
+    ASSERT_TRUE(waitUntil([&] { return server.isListening(); }, 2s));
+
+    NetworkDispatcher worker0(kHost, static_cast<int>(port),
+                              NetworkDispatcherType::COMPETE_CONSUMER);
+    ASSERT_TRUE(waitForSessionCount(server, 1));
+    NetworkDispatcher worker1(kHost, static_cast<int>(port),
+                              NetworkDispatcherType::COMPETE_CONSUMER);
+    ASSERT_TRUE(waitForSessionCount(server, 2));
+    SubscriptionToken token0 = worker0.subscribe(kTopic);
+    SubscriptionToken token1 = worker1.subscribe(kTopic);
+    ASSERT_TRUE(token0.valid());
+    ASSERT_TRUE(token1.valid());
+
+    BrokerClient closable(kHost, static_cast<int>(port));
+    closable.start();
+    ASSERT_TRUE(waitUntil([&] { return closable.isConnected(); }, 2s));
+    ASSERT_TRUE(waitForSessionCount(server, 3));
+    const uint32_t sub_req = closable.generateRequestId();
+    auto sub_fut = closable.sendFrame(sub_req, encodeSubscribeFrame(sub_req, kTopic, kTopic));
+    auto sub_ack = sub_fut.get();
+    ASSERT_EQ(sub_ack->type, ProtocolFrameType::SUBSCRIBE_ACK);
+    ASSERT_NE(sub_ack->subscribe_ack.subscription_id, 0u);
+
+    ASSERT_TRUE(waitUntil([&] { return broker.subscriptionCount() == 3; }, 2s));
+
+    NetworkDispatcher publisher(kHost, static_cast<int>(port));
+    ASSERT_TRUE(waitForSessionCount(server, 4));
+    publisher.publish(kTopic, /*id=*/1, "before-close");
+
+    const uint32_t close_req = closable.generateRequestId();
+    auto close_fut = closable.sendFrame(close_req, encodeCloseFrame(close_req));
+    auto close_ack = close_fut.get();
+    ASSERT_EQ(close_ack->type, ProtocolFrameType::CLOSE_ACK);
+
+    ASSERT_TRUE(waitUntil([&] { return broker.subscriptionCount() == 2; }, 2s))
+        << "CLOSE did not remove closable client's compete subscription";
+
+    for (int i = 0; i < 4; ++i) {
+        publisher.publish(kTopic, /*id=*/10 + i, "after-close-" + std::to_string(i));
+    }
+
+    std::set<uint64_t> remaining_seqs;
+    for (auto* token : {&token0, &token1}) {
+        while (true) {
+            std::shared_ptr<const BrokerMessage> msg;
+            if (!token->mq->dequeueFor(msg, 500ms) || !msg) {
+                break;
+            }
+            remaining_seqs.insert(msg->getSequence());
+        }
+    }
+    // Post-CLOSE: 4 messages to the two remaining workers. Optionally +1 if the
+    // pre-CLOSE publish landed on worker0/1 instead of the closable client.
+    EXPECT_GE(remaining_seqs.size(), 4u);
+    EXPECT_LE(remaining_seqs.size(), 5u);
+
+    worker0.unsubscribe(token0);
+    worker1.unsubscribe(token1);
+    closable.stop();
     server.stop();
 }
 

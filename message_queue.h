@@ -51,7 +51,7 @@ class MessageQueue;
 
 class MessageQueueConfig {
 public:
-    BackpressurePolicy backpressurePolicy = BackpressurePolicy::DropOldest;
+    BackpressurePolicy backpressurePolicy = BackpressurePolicy::RejectNew;
     size_t maxSize = 10000;
 };
 

@@ -44,9 +44,14 @@ private:
     inline static std::atomic<uint64_t> nextSubscriberId_{1};
 };
 
+enum class NetworkDispatcherType {
+    COMPETE_CONSUMER = 1,
+    FANOUT = 2
+};
+
 class NetworkDispatcher : public Dispatcher {
 public:
-    NetworkDispatcher(const std::string& host, int port);
+    NetworkDispatcher(const std::string& host, int port, NetworkDispatcherType type = NetworkDispatcherType::FANOUT);
     ~NetworkDispatcher() override;
 
     void handle_deliver_message(const DeliverMessage& message);
@@ -65,6 +70,7 @@ private:
     std::map<uint64_t, SubscriptionToken> subscription_tokens_;
     std::map<uint32_t, SubscriptionToken> pending_by_request_id_;
     mutable std::mutex subscription_tokens_mutex_;
+    NetworkDispatcherType type_;
 };
 
 #endif

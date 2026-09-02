@@ -45,9 +45,16 @@ public:
     bool publish(const std::string topic, const std::string group, const Message& msg, bool buffer = true);
     bool publish(const std::string topic, const Message& msg);
 
+    // Assign the next per-topic sequence under topic_mtx without enqueuing.
+    // Returns false if the topic does not exist (same as publish(topic, msg)
+    // with no subscribers). On success, writes the assigned sequence to |out_seq|.
+    bool allocateSequence(const std::string& topic, uint64_t& out_seq);
+
     std::size_t groupCount(const std::string& topic) const;
     std::size_t subscriptionCount() const;
     std::size_t totalGroupCount() const;
+
+    const MessageQueueConfig& getConfig() const { return config; }
 
 private:
     void decrementMemberCount(Group& group);
