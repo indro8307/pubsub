@@ -25,8 +25,9 @@ That engine runs in two modes:
 Either way, application code uses `Publisher` / `Subscriber`. A `Dispatcher`
 underneath picks the delivery policy (and, for networking, the transport):
 `CompeteConsumerDispatcher` and `FanoutDispatcher` for local use,
-`NetworkDispatcher` for TCP. Today `NetworkDispatcher` only does fan-out (see
-[Known limitations](#known-limitations)).
+`NetworkDispatcher` for TCP. Over the wire, `NetworkDispatcherType` selects
+**fan-out** (default: unique UUID group per subscriber) or **compete consumer**
+(shared group = topic name).
 
 ---
 
@@ -71,9 +72,10 @@ underneath picks the delivery policy (and, for networking, the transport):
   threads. The TCP broker uses a single epoll reactor (no thread-per-connection
    or thread-per-subscription). Shutdown is event-driven. Teardown is meant to
    stay race-free under ThreadSanitizer.
-4. **Bounded memory (in-process queues).** Every `MessageQueue` is bounded with
-  a configurable backpressure policy. Network-path backpressure is not wired up
-   yet (see limitations).
+4. **Bounded memory.** Every in-process `MessageQueue` is bounded with a
+  configurable backpressure policy. On the TCP path, each `Session` write queue
+   is also capped (`MessageQueueConfig::maxSize`); today only **RejectNew** is
+   enforced for outbound `DELIVER` (see [Backpressure](#backpressure)).
 5. **Same app API on or off process.** `NetworkDispatcher` implements
   `Dispatcher` over TCP so `Publisher` / `Subscriber` call sites stay the same.
 6. **Bad wire input should not crash the process.** Decoders check inner
@@ -114,7 +116,8 @@ underneath picks the delivery policy (and, for networking, the transport):
         │                                         │
    local MessageQueue ◄── DELIVER ── Session write buffer (enqueueFrame / flush)
         │                                         │
-   Subscriber worker                    indexes: topic→subs, id→sub, session→ids
+   Subscriber worker                    indexes: topic→groups→subs, id→sub,
+                                        session→ids; Group RR on publish
                                         MessageBroker (subscribe / allocateSequence)
 ```
 
@@ -131,10 +134,10 @@ outbound write buffers.
 | `MessageBroker`     | Routing: `topics → groups → queue`, sequencing, subscribe/unsubscribe; `allocateSequence` for the network path.   |
 | `MessageQueue`      | Per-group (or client-local) bounded FIFO + backpressure strategy.                                                   |
 | `protocol_frame`    | Length-prefixed frame codec (`[docs/protocol.md](docs/protocol.md)`).                                               |
-| `BrokerServer`      | Epoll reactor: accept, recv/parse frames, protocol handlers, non-blocking writes; owns sessions + sub indexes.    |
+| `BrokerServer`      | Epoll reactor: accept, recv/parse frames, protocol handlers, non-blocking writes; owns sessions + group indexes.  |
 | `Session`           | One TCP client: outbound write queue (`enqueueFrame` / `flush`) and per-connection subscription-id list.          |
 | `BrokerClient`      | TCP client: connect/receive thread, `sendFrame` + ack futures, DELIVER / subscribe-ack hooks.                       |
-| `NetworkDispatcher` | Owns a `BrokerClient`; maps wire `subscription_id` → local `MessageQueue`.                                          |
+| `NetworkDispatcher` | Owns a `BrokerClient`; `NetworkDispatcherType` picks fan-out vs compete group naming; demuxes `DELIVER` locally.  |
 
 
 Dependency direction: `Publisher` / `Subscriber` → `Dispatcher` → (local broker
@@ -194,8 +197,11 @@ group. Publishes via `broker.publish(topic, group, msg, buffer=true)`.
 (`topic + "_sub_" + <id>`) from a process-wide atomic counter. Publishes via
 `broker.publish(topic, msg)`.
 - `NetworkDispatcher` — owns a `BrokerClient` (host/port; `start` in the
-ctor, `stop` in the dtor). Over the wire it always allocates a **UUID** group
-(`topic + "_sub_" + uuid`) so names stay unique across processes/hosts.
+ctor, `stop` in the dtor). Construct with `NetworkDispatcherType`:
+  - **`FANOUT` (default)** — unique group per subscribe
+    (`topic + "_sub_" + uuid`) so names stay unique across processes/hosts.
+  - **`COMPETE_CONSUMER`** — group name equals the topic, so multiple TCP
+    clients compete; the server picks one member per group via round-robin.
 Publish / subscribe / unsubscribe send frames and wait for acks. Incoming
 `DELIVER` is demuxed into a **local** `MessageQueue` so existing `Subscriber`
 workers keep working unchanged.
@@ -213,8 +219,8 @@ Wire format is in `[docs/protocol.md](docs/protocol.md)` (big-endian integers,
 | Role         | Behavior                                                                                                                                                                                                                                                                 |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Server**   | One epoll thread accepts and drives all client fds. Incomplete reads accumulate in per-fd `read_bufs_`. Handlers: `SUBSCRIBE` / `UNSUBSCRIBE` / `PUBLISH` / `CLOSE`. Outbound frames go through each `Session` write buffer; short writes arm `EPOLLOUT`.              |
-| **Publish**  | Does **not** enqueue into broker group queues for TCP delivery. After `allocateSequence`, server sends `PUBLISH_ACK` then fans out `DELIVER` into subscriber write buffers (ACK is not “flushed to all subscribers”).                                                 |
-| **Indexes**  | `subscriptions_by_topics_` (fan-out), `subscriptions_by_id_` (unsubscribe), and each `Session`’s `subscription_ids_` (fast `closeClient` / `stop` without scanning every topic). `broker.subscribe` still registers groups for sequencing / membership bookkeeping. |
+| **Publish**  | Does **not** enqueue into broker group queues for TCP delivery. After `allocateSequence`, server sends `PUBLISH_ACK`, then for each group on the topic picks one member (`Group::getNextSubscription` round-robin) and enqueues `DELIVER` into that session’s write buffer (ACK is not “flushed to all subscribers”). |
+| **Indexes**  | `subscriptions_by_topics_groups_` (`topic → vector<Group>` → members), `subscriptions_by_id_` (unsubscribe), and each `Session`’s `subscription_ids_` (fast `closeClient` / `stop`). Wire `group` string selects the compete set; distinct groups fan out. `broker.subscribe` still registers groups for sequencing / membership bookkeeping. |
 | **Client**   | Unchanged shape: `BrokerClient` receive thread; `sendFrame` + ack futures keyed by `request_id`.                                                                                                                                                                       |
 | **Teardown** | `CLOSE` or peer drop → `closeClient`: epoll DEL, scrub indexes, `broker.unsubscribe`, `shutdown`/`close`, `clearFd`. Server `stop` joins the reactor, then closes remaining clients the same way.                                                                      |
 
@@ -300,19 +306,27 @@ default `10000`) and enforces one of three policies via a Strategy pattern:
 | Policy                   | When full                                      | Publisher effect          | Data loss            | Use when                          |
 | ------------------------ | ---------------------------------------------- | ------------------------- | -------------------- | --------------------------------- |
 | **Block**                | wait on `not_full_cv` until space or `closed_` | publish thread stalls     | none (unless closed) | must not lose data                |
-| **DropOldest** (default) | drop oldest, push new                          | always succeeds           | oldest evicted       | telemetry / keep producers moving |
-| **RejectNew**            | return `false`                                 | `publish` reports failure | new message rejected | non-blocking failure visibility   |
+| **DropOldest**           | drop oldest, push new                          | always succeeds           | oldest evicted       | telemetry / keep producers moving |
+| **RejectNew** (default)  | return `false` / skip enqueue                  | `publish` reports failure (in-process); TCP skips `DELIVER` | new message rejected | non-blocking failure visibility   |
 
 
 - Backpressure is an **enqueue** concern. Lock / CV / dequeue live in
 `MessageQueue`; the strategy runs while the queue already holds its mutex.
 - **Fan-out isolates slow subscribers** to their own queues. Under **Block**,
 serial fan-out enqueue can still stall the whole publish for later groups —
-hence `DropOldest` as the default.
-- On the **network path** (v2) delivery is reactor → session write buffer →
-TCP → client-local queue. There is no end-to-end backpressure yet: a slow
-client does not push load back to the publisher in a controlled way, and
-write-buffer growth is unbounded aside from TCP/`EPOLLOUT` stalling sends.
+hence non-blocking defaults for shared publishers.
+- **Network path (session write queues).** On `PUBLISH`, before enqueuing a
+`DELIVER`, `BrokerServer` checks
+`session->getEnqueuedFrameCount() < config.maxSize` (from
+`MessageBroker::getConfig()`). If the session is at capacity, that `DELIVER` is
+**skipped** (**RejectNew**). Control frames (`*_ACK`) still go through
+`buildAndSendFrame` without this gate. **DropOldest** on the write path is not
+implemented yet ([issue #26](https://github.com/indro8307/pubsub/issues/26));
+**Block** cannot run on the epoll thread.
+- Isolation is **per session**: a stuck consumer’s full write buffer does not
+stop `DELIVER`s to other sessions. Under compete, skipping a `DELIVER` for the
+chosen member drops that sequence for the group unless a later retry policy is
+added.
 
 ---
 
@@ -383,18 +397,19 @@ buffer cannot flush before the fd is closed.
 - Sequences are **broker-assigned and monotonic per topic**, starting at `1`.
 - **Fan-out:** one `BrokerMessage` (one sequence) is shared to all group queues;
 each fan-out subscriber should see the full set `1..N`.
-- **Compete:** the group collectively sees each sequence once.
+- **Compete:** the group collectively sees each sequence once (in-process and
+over TCP via per-group round-robin on the reactor thread).
 - **Order across concurrent publishers (in-process / Phase 3 v1 path):** fan-out
 `publish` assigns a sequence under the lock, then enqueues to groups *after*
 releasing `topic_mtx`, so concurrent publishes can interleave enqueues (same
 multiset of sequences, possibly **non-monotonic** order per subscriber queue).
 - **Network Phase 3 v2:** sequences come from `allocateSequence`; `DELIVER`
-fan-out runs on the single epoll thread, so each subscriber’s write buffer sees
-publishes in reactor order (strictly increasing sequences per connection under
-normal operation). Cross-subscriber *identical* order is not asserted by the
-concurrent network stress test.
+routing runs on the single epoll thread (one member per group), so each
+subscriber’s write buffer sees publishes in reactor order (strictly increasing
+sequences per connection under normal operation). Cross-subscriber *identical*
+order is not asserted by the concurrent network stress test.
 
-Covered by in-process sequence tests and network fan-out / stress tests.
+Covered by in-process sequence tests, `NetworkCompeteTests`, and network fan-out / stress tests.
 
 ---
 
@@ -409,6 +424,8 @@ Covered by in-process sequence tests and network fan-out / stress tests.
 | `Dispatcher` as the boundary                            | Parallel `IBroker` stack                    | Network client implements `Dispatcher`; app API unchanged              |
 | `NetworkDispatcher` owns `BrokerClient` by value        | Shared/raw client injected everywhere       | Clear lifetime: ctor `start`, dtor `stop`                              |
 | UUID fan-out groups on the wire                         | Process-local atomic counter only           | Counters collide across processes/hosts                                |
+| `NetworkDispatcherType` fan-out vs compete              | Fan-out-only network client                 | Same `Dispatcher` API; wire group string selects topology              |
+| Server `topic → groups → RR member`                     | Flat `topic → all subs` fan-out list        | One index serves both compete and fan-out over TCP                     |
 | Subscribe-ack hook before promise fulfill               | Fulfill then register map                   | Stops first `DELIVER` racing an empty client map                       |
 | Single epoll reactor + per-session write buffers (v2)   | Thread-per-connection / per-subscription    | Scales under TSan; avoids deliverer-thread explosion                   |
 | Network publish via `allocateSequence` + `DELIVER`      | `broker.publish` into group queues          | Queues were never drained on the TCP path; sequences without enqueue |
@@ -424,7 +441,8 @@ Covered by in-process sequence tests and network fan-out / stress tests.
 | `close()` only on last unsubscribe                      | Close in every `Subscriber::stop()`         | Shared compete queues must stay open for siblings                      |
 | Predicate `dequeueUntil`                                | Polling `dequeueFor`                        | Lower shutdown latency                                                 |
 | Ephemeral groups                                        | Durable groups                              | MVP simplicity                                                         |
-| `DropOldest @ 10k` default                              | `Block` default                             | Avoid wedging publishers under fan-out                                 |
+| `RejectNew @ 10k` default (queues + session DELIVER)    | `Block` / unbounded session buffers         | Avoid wedging the reactor or publishers under slow consumers           |
+| Session RejectNew on `DELIVER` only                     | Cap ACKs the same way                       | Dropping ACKs hangs client RPC futures                                 |
 | Network stress: concurrent pubs, per-sub increasing seq | Require identical order across all subs     | Realistic load; identical order needs a separate serialized test      |
 
 
@@ -437,12 +455,13 @@ Covered by in-process sequence tests and network fan-out / stress tests.
 - In-memory broker only; no persistence.
 - Pub-sub `publish(topic, msg)` drops messages before any subscriber exists.
 - **Block** + fan-out: one full queue can stall later groups in the same publish.
-- `NetworkDispatcher` **is fan-out only.** Subscribe always allocates a unique
-UUID group. Compete-over-TCP (several network clients sharing one group) is
-not exposed.
-- **No network-layer backpressure.** Client-local queues are bounded; server
-session write buffers are not capacity-limited. Slow consumers do not apply
-controlled pushback to publishers over TCP.
+- Network session backpressure is **RejectNew for `DELIVER` only**.
+**DropOldest** on write buffers is TBD
+([issue #26](https://github.com/indro8307/pubsub/issues/26)); **Block** is not
+usable on the epoll thread. There is still no end-to-end “publisher slows down”
+signal beyond `PUBLISH_ACK` acceptance.
+- Under compete, a RejectNew skip on the chosen member’s session **loses that
+sequence for the group** (no retry-next-member yet).
 - `PUBLISH_ACK` means accepted/sequenced, not “delivered on the wire.”
 - `CLOSE_ACK` may not fully flush before the server closes the socket.
 - Concurrent client publishes are still handled one-at-a-time on the epoll
@@ -534,6 +553,7 @@ python3 run_tests.py --build
 python3 run_tests.py -s fanout_tests
 # Network / protocol (from build dir if not listed in run_tests.py):
 ./build-debug/network_tests --gtest_filter='NetworkTests.*'
+./build-debug/network_tests --gtest_filter='NetworkCompeteTests.*'
 ./build-debug/network_tests --gtest_filter='NetworkStress.*'   # slow
 ./build-debug/protocol_frame_tests --gtest_filter='ProtocolFrameCorruptLength.*'
 ```
@@ -550,7 +570,7 @@ python3 run_tests.py -s fanout_tests
 | `fanout_tests`               | all-receive, isolation, sequences, large payloads, backpressure, in-process stress                                                                                        |
 | `subscriber_lifecycle_tests` | stop/join, subscribe-after-stop, handler exceptions                                                                                                                       |
 | `protocol_frame_tests`       | codec round-trips; corrupt/truncated inner lengths                                                                                                                        |
-| `network_tests`              | TCP connect, subscribe/publish/unsubscribe, fan-out, teardown, malformed frames, session multiplex; `NetworkStress` (50 dispatchers × 100 subs, **concurrent** publish, per-sub strictly increasing sequences) |
+| `network_tests`              | TCP connect, subscribe/publish/unsubscribe, fan-out, teardown, malformed frames, session multiplex; **`NetworkCompeteTests`** (RR counts, zero-sub publish, fan-out+compete same topic, mid-stream unsub, late join, CLOSE cleanup); `NetworkStress` (50 dispatchers × 100 subs, concurrent publish, per-sub strictly increasing sequences) |
 
 
 
@@ -570,13 +590,14 @@ do not share state.
 
 ## Roadmap
 
-- Compete-over-TCP (shared group name API on `NetworkDispatcher`).
-- Network-layer / end-to-end backpressure.
+- Session write-buffer **DropOldest** (and safer ACK vs DELIVER queue split);
+see [issue #26](https://github.com/indro8307/pubsub/issues/26).
+- Compete: retry next group member if the chosen session RejectNews a `DELIVER`.
 - Per-request ACK timeouts without tearing down the connection.
 - Optional `ENABLE_TSAN` CMake option and keep `run_tests.py` suite list in sync.
 - Persistence / durable groups (deferred from MVP).
 - Slow-subscriber isolation under Block (non-serial fan-out enqueue / thread pool).
-- Bounded server write buffers / network backpressure signaling.
 - Multi-reactor or worker-pool fan-out if single-threaded publish handling becomes the bottleneck.
 - io_uring (or similar) as a follow-on to epoll.
+- Counters to enhance observability.
 
