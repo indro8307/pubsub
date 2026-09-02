@@ -54,6 +54,8 @@ public:
     std::size_t subscriptionCount() const;
     std::size_t totalGroupCount() const;
 
+    const MessageQueueConfig& getConfig() const { return config; }
+
 private:
     void decrementMemberCount(Group& group);
 };

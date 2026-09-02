@@ -53,6 +53,8 @@ public:
     const std::vector<uint64_t>& subscriptionIds() const { return subscription_ids_; }
     void clearSubscriptionIds() { subscription_ids_.clear(); }
 
+    inline size_t getEnqueuedFrameCount() { return queue_.size(); }
+
 private:
 
     int client_fd_;

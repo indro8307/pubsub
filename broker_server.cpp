@@ -476,10 +476,14 @@ bool BrokerServer::handlePublish(int client_fd, std::vector<uint8_t>& frame_data
         if (sub_fd < 0) {
             continue;
         }
-        if (buildAndSendFrame(sub_fd, ProtocolFrameType::DELIVER, body,
-                              subscription->session_) == FlushResult::FLUSH_CLOSE) {
-            fds_to_close.push_back(sub_fd);
+        MessageQueueConfig config = broker_.getConfig();
+        if (subscription->session_->getEnqueuedFrameCount() < config.maxSize) {
+            if (buildAndSendFrame(sub_fd, ProtocolFrameType::DELIVER, body,
+                                subscription->session_) == FlushResult::FLUSH_CLOSE) {
+                fds_to_close.push_back(sub_fd);
+            }
         }
+        // Currently only RejectNew backpressure policy is supported.
     }
 
     flush_close_fds();
