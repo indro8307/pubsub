@@ -13,6 +13,7 @@ SUITES = (
     "compete_tests",
     "fanout_tests",
     "subscriber_lifecycle_tests",
+    "protocol_frame_tests",
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
