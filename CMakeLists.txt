@@ -27,6 +27,16 @@ add_executable(pubsub main.cpp ${PUBSUB_SOURCES})
 target_include_directories(pubsub PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${UUID_INCLUDE_DIR})
 target_link_libraries(pubsub PRIVATE Threads::Threads ${UUID_LIBRARY})
 
+# E2E load generator (expects an already-running BrokerServer).
+add_executable(loadgen loadgen/main.cpp ${PUBSUB_SOURCES})
+target_include_directories(loadgen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${UUID_INCLUDE_DIR})
+target_link_libraries(loadgen PRIVATE Threads::Threads ${UUID_LIBRARY})
+
+# Standalone TCP broker process (BrokerServer + MessageBroker).
+add_executable(broker broker_main.cpp ${PUBSUB_SOURCES})
+target_include_directories(broker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${UUID_INCLUDE_DIR})
+target_link_libraries(broker PRIVATE Threads::Threads ${UUID_LIBRARY})
+
 # --- GoogleTest (FetchContent) ---
 include(FetchContent)
 FetchContent_Declare(
