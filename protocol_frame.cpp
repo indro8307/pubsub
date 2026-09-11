@@ -1,6 +1,7 @@
 #include "protocol_frame.h"
 
 #include <cstddef>
+#include <cstring>
 #include <stdexcept>
 
 constexpr size_t kFrameHeaderSize = 2; // version + type
@@ -10,11 +11,26 @@ void encode_u16(uint16_t value, std::vector<uint8_t>& buffer) {
     buffer.push_back(static_cast<uint8_t>(value));
 }
 
+void encode_u16(uint16_t value, char* buffer) {
+    // assume buffer is at least 2 bytes long
+    buffer[0] = static_cast<uint8_t>(value >> 8);
+    buffer[1] = static_cast<uint8_t>(value);
+
+}
+
 void encode_u32(uint32_t value, std::vector<uint8_t>& buffer) {
     buffer.push_back(static_cast<uint8_t>(value >> 24));
     buffer.push_back(static_cast<uint8_t>(value >> 16));
     buffer.push_back(static_cast<uint8_t>(value >> 8));
     buffer.push_back(static_cast<uint8_t>(value));
+}
+
+void encode_u32(uint32_t value, char* buffer) {
+    // assume buffer is at least 4 bytes long
+    buffer[0] = static_cast<uint8_t>(value >> 24);
+    buffer[1] = static_cast<uint8_t>(value >> 16);
+    buffer[2] = static_cast<uint8_t>(value >> 8);
+    buffer[3] = static_cast<uint8_t>(value);
 }
 
 void encode_u64(uint64_t value, std::vector<uint8_t>& buffer) {
@@ -26,6 +42,18 @@ void encode_u64(uint64_t value, std::vector<uint8_t>& buffer) {
     buffer.push_back(static_cast<uint8_t>(value >> 16));
     buffer.push_back(static_cast<uint8_t>(value >> 8));
     buffer.push_back(static_cast<uint8_t>(value));
+}
+
+void encode_u64(uint64_t value, char* buffer) {
+    // assume buffer is at least 8 bytes long
+    buffer[0] = static_cast<uint8_t>(value >> 56);
+    buffer[1] = static_cast<uint8_t>(value >> 48);
+    buffer[2] = static_cast<uint8_t>(value >> 40);
+    buffer[3] = static_cast<uint8_t>(value >> 32);
+    buffer[4] = static_cast<uint8_t>(value >> 24);
+    buffer[5] = static_cast<uint8_t>(value >> 16);
+    buffer[6] = static_cast<uint8_t>(value >> 8);
+    buffer[7] = static_cast<uint8_t>(value);
 }
 
 uint16_t decode_u16(const std::vector<uint8_t>& buffer, size_t offset) {
@@ -61,6 +89,16 @@ uint64_t decode_u64(const std::vector<uint8_t>& buffer, size_t offset) {
 void encode_frame_header(FrameHeader& header, std::vector<uint8_t>& buffer) {
     buffer.push_back(header.version);
     buffer.push_back(static_cast<uint8_t>(header.type));
+}
+
+void encode_frame_header(FrameHeader& header, char* buffer) {
+    buffer[0] = static_cast<char>(header.version);
+    buffer[1] = static_cast<char>(static_cast<uint8_t>(header.type));
+}
+
+size_t encode_frame_header_size() {
+    // version + type
+    return kFrameHeaderSize;
 }
 
 // decode a frame header
@@ -153,6 +191,24 @@ void encode_publish_request(PublishRequest& request, std::vector<uint8_t>& buffe
     buffer.insert(buffer.end(), request.topic.begin(), request.topic.end());
     encode_u32(static_cast<uint32_t>(request.payload.size()), buffer);
     buffer.insert(buffer.end(), request.payload.begin(), request.payload.end());
+}
+
+size_t encode_publish_request_size(const PublishRequest& request) {
+    // u32 request_id + u16 topic_len + topic + u32 payload_len + payload
+    return sizeof(uint32_t) + sizeof(uint16_t) + request.topic.size() +
+           sizeof(uint32_t) + request.payload.size();
+}
+
+void encode_publish_request(PublishRequest& request, char* buffer) {
+    encode_u32(request.request_id, buffer);
+    buffer += sizeof(uint32_t);
+    encode_u16(static_cast<uint16_t>(request.topic.size()), buffer);
+    buffer += sizeof(uint16_t);
+    std::memcpy(buffer, request.topic.data(), request.topic.size());
+    buffer += request.topic.size();
+    encode_u32(static_cast<uint32_t>(request.payload.size()), buffer);
+    buffer += sizeof(uint32_t);
+    std::memcpy(buffer, request.payload.data(), request.payload.size());
 }
 
 // decode a publish request

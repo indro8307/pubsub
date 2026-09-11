@@ -16,7 +16,7 @@
 // Sample usage (two terminals; pin cores for cleaner numbers):
 //   taskset -c 0 ./build-release/broker 1883
 //   taskset -c 1-2 ./build-release/loadgen
-//   taskset -c 1-2 ./build-release/loadgen -h 127.0.0.1 -p 1883 -t test -n 60000 -b 64 -i 1
+//   taskset -c 1-2 ./build-release/loadgen -h 127.0.0.1 -p 1883 -t test -n 60000 -b 64 -i 1000
 //
 #include "dispatcher.h"
 #include "publisher.h"
@@ -49,7 +49,7 @@ struct Config {
     std::string topic = "test";
     int message_count = 60000;
     int payload_bytes = 64;
-    std::chrono::milliseconds publish_interval{1};
+    std::chrono::microseconds publish_interval{1000};  // 1 ms
 };
 
 struct Timestamps {
@@ -71,7 +71,7 @@ void printUsage(const char* argv0) {
         << "  -t <topic>           topic name (default: test)\n"
         << "  -n <message_count>   number of messages (default: 60000)\n"
         << "  -b <payload_bytes>   payload size in bytes, >= 4 (default: 64)\n"
-        << "  -i <interval_ms>     publish interval in ms (default: 1)\n"
+        << "  -i <interval_us>     publish interval in us (default: 1000)\n"
         << "  --help               show this help\n";
 }
 
@@ -117,11 +117,11 @@ Config parseArgs(int argc, char** argv) {
                     }
                     break;
                 case 'i': {
-                    const int interval_ms = std::stoi(optarg);
-                    if (interval_ms <= 0) {
-                        throw std::out_of_range("interval_ms must be > 0");
+                    const long long interval_us = std::stoll(optarg);
+                    if (interval_us <= 0) {
+                        throw std::out_of_range("interval_us must be > 0");
                     }
-                    cfg.publish_interval = std::chrono::milliseconds(interval_ms);
+                    cfg.publish_interval = std::chrono::microseconds(interval_us);
                     break;
                 }
                 default:
@@ -217,24 +217,29 @@ void runPublisher(const Config& cfg) {
         }
 
         //publisher.publish(cfg.topic, messages[static_cast<size_t>(i)]);
-        std::vector<uint8_t> frame_buffer;
-        // Create and encode the frame header
-        FrameHeader frame_header;
-        frame_header.version = PROTOCOL_VERSION;
-        frame_header.type = ProtocolFrameType::PUBLISH;
-        encode_frame_header(frame_header, frame_buffer);
-
-        // Create and encode the publish request
         PublishRequest publish_request;
         publish_request.request_id = bclient.generateRequestId();
         publish_request.topic = cfg.topic;
         publish_request.payload.assign(messages[static_cast<size_t>(i)].begin(),
                                        messages[static_cast<size_t>(i)].end());
-        encode_publish_request(publish_request, frame_buffer);
 
-        // Send the frame buffer to the broker client
-        //std::future<std::shared_ptr<RequestResult>> fut_ret =
-        bclient.sendFrame(publish_request.request_id, frame_buffer);
+        const size_t frame_len =
+            encode_frame_header_size() + encode_publish_request_size(publish_request);
+        // 4 bytes reserved at front for wire length (filled by sendFrame).
+        std::vector<uint8_t> frame_buffer(4 + frame_len);
+
+        FrameHeader frame_header;
+        frame_header.version = PROTOCOL_VERSION;
+        frame_header.type = ProtocolFrameType::PUBLISH;
+        encode_frame_header(frame_header,
+                            reinterpret_cast<char*>(frame_buffer.data() + 4));
+        encode_publish_request(
+            publish_request,
+            reinterpret_cast<char*>(frame_buffer.data() + 4 + encode_frame_header_size()));
+
+        bclient.sendFrame(publish_request.request_id,
+                          reinterpret_cast<char*>(frame_buffer.data()),
+                          frame_len);
     }
 }
 
@@ -305,5 +310,7 @@ int main(int argc, char** argv) {
     std::cout << "P50 latency: " << pct(0.50) << " us\n";
     std::cout << "P90 latency: " << pct(0.90) << " us\n";
     std::cout << "P99 latency: " << pct(0.99) << " us\n";
+    std::cout << "P999 latency: " << pct(0.999) << " us\n";
+    std::cout << "Max latency: " << latencies.back() << " us\n";
     return 0;
 }
