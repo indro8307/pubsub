@@ -462,24 +462,42 @@ bool BrokerServer::handlePublish(int client_fd, std::vector<uint8_t>& frame_data
     DeliverMessage deliver;
     deliver.topic = publish_request.topic;
     deliver.sequence = sequence;
-    deliver.payload = publish_request.payload;
+    deliver.payload = std::move(publish_request.payload);
 
     for (auto& group : groups) {
         auto subscription = group->getNextSubscription();
         if (subscription == nullptr) {
             continue;
         }
-        deliver.subscription_id = subscription->token_.id;
-        std::vector<uint8_t> body;
-        encode_deliver_message(deliver, body);
         const int sub_fd = subscription->session_->fd();
         if (sub_fd < 0) {
             continue;
         }
         MessageQueueConfig config = broker_.getConfig();
         if (subscription->session_->getEnqueuedFrameCount() < config.maxSize) {
-            if (buildAndSendFrame(sub_fd, ProtocolFrameType::DELIVER, body,
-                                subscription->session_) == FlushResult::FLUSH_CLOSE) {
+            deliver.subscription_id = subscription->token_.id;
+
+            const size_t frame_len =
+                encode_frame_header_size() + encode_deliver_message_size(deliver);
+            if (frame_len > PROTOCOL_FRAME_MAX_SIZE) {
+                throw std::runtime_error("Outbound frame exceeds PROTOCOL_FRAME_MAX_SIZE");
+            }
+            // 4 bytes reserved at front for wire length.
+            std::vector<uint8_t> frame_buffer(4 + frame_len);
+            encode_u32(static_cast<uint32_t>(frame_len),
+                       reinterpret_cast<char*>(frame_buffer.data()));
+
+            FrameHeader frame_header;
+            frame_header.version = PROTOCOL_VERSION;
+            frame_header.type = ProtocolFrameType::DELIVER;
+            encode_frame_header(frame_header,
+                                reinterpret_cast<char*>(frame_buffer.data() + 4));
+            encode_deliver_message(
+                deliver,
+                reinterpret_cast<char*>(frame_buffer.data() + 4 + encode_frame_header_size()));
+
+            if (sendWireFrame(sub_fd, ProtocolFrameType::DELIVER, std::move(frame_buffer),
+                              subscription->session_) == FlushResult::FLUSH_CLOSE) {
                 fds_to_close.push_back(sub_fd);
             }
         }
@@ -757,26 +775,10 @@ void BrokerServer::reapFinishedSessions() {
     }
 }
 
-FlushResult BrokerServer::buildAndSendFrame(int client_fd, ProtocolFrameType type, const std::vector<uint8_t>& body, 
-                                           std::shared_ptr<Session> session) 
+FlushResult BrokerServer::sendWireFrame(int client_fd, ProtocolFrameType type, std::vector<uint8_t> wire,
+                                        std::shared_ptr<Session> session)
 {
-    FrameHeader header;
-    header.version = PROTOCOL_VERSION;
-    header.type = type;
-
-    std::vector<uint8_t> frame;
-    encode_frame_header(header, frame);
-    frame.insert(frame.end(), body.begin(), body.end());   // copy 1 
-
-    if (frame.size() > PROTOCOL_FRAME_MAX_SIZE) {
-        throw std::runtime_error("Outbound frame exceeds PROTOCOL_FRAME_MAX_SIZE");
-    }
-
-    std::vector<uint8_t> wire;
-    encode_u32(static_cast<uint32_t>(frame.size()), wire);
-    wire.insert(wire.end(), frame.begin(), frame.end());   // copy 2 copy from frame to wire.
-
-    session->enqueueFrame(type, wire);
+    session->enqueueFrame(type, std::move(wire));
     FlushResult result = session->flush();
     if (result == FlushResult::FLUSH_EPOLLOUT) {
         // fd is already in epoll with EPOLLIN; MOD so we keep reading and
@@ -795,4 +797,24 @@ FlushResult BrokerServer::buildAndSendFrame(int client_fd, ProtocolFrameType typ
     // FLUSH_CLOSE: do not closeClient here — caller must, so we never reenter
     // subscription-map mutation from mid fan-out / mid-handler.
     return result;
+}
+
+FlushResult BrokerServer::buildAndSendFrame(int client_fd, ProtocolFrameType type, const std::vector<uint8_t>& body, 
+                                           std::shared_ptr<Session> session) 
+{
+    const size_t frame_len = encode_frame_header_size() + body.size();
+    if (frame_len > PROTOCOL_FRAME_MAX_SIZE) {
+        throw std::runtime_error("Outbound frame exceeds PROTOCOL_FRAME_MAX_SIZE");
+    }
+
+    std::vector<uint8_t> wire;
+    wire.reserve(sizeof(uint32_t) + frame_len);
+    encode_u32(static_cast<uint32_t>(frame_len), wire);
+    FrameHeader header;
+    header.version = PROTOCOL_VERSION;
+    header.type = type;
+    encode_frame_header(header, wire);
+    wire.insert(wire.end(), body.begin(), body.end());
+
+    return sendWireFrame(client_fd, type, std::move(wire), session);
 }

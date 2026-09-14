@@ -34,6 +34,13 @@ void Session::enqueueFrame(ProtocolFrameType type, const std::vector<uint8_t>& b
     queue_.push_back(std::move(encoded_frame));
 }
 
+void Session::enqueueFrame(ProtocolFrameType type, std::vector<uint8_t>&& body) {
+    auto encoded_frame = std::make_shared<EncodedFrame>();
+    encoded_frame->type_ = type;
+    encoded_frame->body_ = std::move(body);
+    queue_.push_back(std::move(encoded_frame));
+}
+
 FlushResult Session::flush()
 {
     // Look at the first frame in the queue. Send the bytes that are still left:

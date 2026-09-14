@@ -39,6 +39,7 @@ public:
 
     // Enqueue a frame to be sent to the client.
     void enqueueFrame(ProtocolFrameType type, const std::vector<uint8_t>& body);
+    void enqueueFrame(ProtocolFrameType type, std::vector<uint8_t>&& body);
 
     int fd() const { return client_fd_; }
 

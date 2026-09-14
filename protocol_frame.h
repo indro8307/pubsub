@@ -128,6 +128,8 @@ void encode_publish_ack(PublishAck& ack, std::vector<uint8_t>& buffer);
 void decode_publish_ack(PublishAck& ack, std::vector<uint8_t>& buffer);
 
 void encode_deliver_message(DeliverMessage& message, std::vector<uint8_t>& buffer);
+void encode_deliver_message(DeliverMessage& message, char* buffer);
+size_t encode_deliver_message_size(const DeliverMessage& message);
 void decode_deliver_message(DeliverMessage& message, std::vector<uint8_t>& buffer);
 
 void encode_close_request(CloseRequest& request, std::vector<uint8_t>& buffer);

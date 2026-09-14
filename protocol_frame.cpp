@@ -270,6 +270,25 @@ void encode_deliver_message(DeliverMessage& message, std::vector<uint8_t>& buffe
     buffer.insert(buffer.end(), message.payload.begin(), message.payload.end());
 }
 
+size_t encode_deliver_message_size(const DeliverMessage& message) {
+    return sizeof(uint64_t) + sizeof(uint16_t) + message.topic.size() +
+           sizeof(uint64_t) + sizeof(uint32_t) + message.payload.size();
+}
+
+void encode_deliver_message(DeliverMessage& message, char* buffer) {
+    encode_u64(message.subscription_id, buffer);
+    buffer += sizeof(uint64_t);
+    encode_u16(static_cast<uint16_t>(message.topic.size()), buffer);
+    buffer += sizeof(uint16_t);
+    std::memcpy(buffer, message.topic.data(), message.topic.size());
+    buffer += message.topic.size();
+    encode_u64(message.sequence, buffer);
+    buffer += sizeof(uint64_t);
+    encode_u32(static_cast<uint32_t>(message.payload.size()), buffer);
+    buffer += sizeof(uint32_t);
+    std::memcpy(buffer, message.payload.data(), message.payload.size());
+}
+
 // decode a deliver message
 void decode_deliver_message(DeliverMessage& message, std::vector<uint8_t>& buffer) {
     size_t offset = kFrameHeaderSize;
