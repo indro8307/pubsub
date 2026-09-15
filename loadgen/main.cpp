@@ -52,14 +52,14 @@ struct Config {
     std::chrono::microseconds publish_interval{1000};  // 1 ms
 };
 
-struct Timestamps {
+struct alignas(64) Timestamps {
     int64_t intended_send_us = 0;
     int64_t actual_send_us = 0;
     int64_t actual_receive_us = 0;
 };
 
 std::vector<Timestamps> g_timestamps;
-std::mutex g_timestamps_mutex;
+//std::mutex g_timestamps_mutex;
 std::atomic<int> g_recv_count{0};
 int g_message_count = 0;
 
@@ -174,7 +174,7 @@ void subscriberReceiveHandler(const BrokerMessage& message) {
 
     const int64_t actual_receive_us = nowMicros();
     {
-        std::lock_guard<std::mutex> lock(g_timestamps_mutex);
+        //std::lock_guard<std::mutex> lock(g_timestamps_mutex);
         g_timestamps[unique_id].actual_receive_us = actual_receive_us;
     }
     g_recv_count.fetch_add(1, std::memory_order_relaxed);
@@ -211,7 +211,7 @@ void runPublisher(const Config& cfg) {
                 .count();
         const int64_t actual_send_us = nowMicros();
         {
-            std::lock_guard<std::mutex> lock(g_timestamps_mutex);
+            //std::lock_guard<std::mutex> lock(g_timestamps_mutex);
             g_timestamps[static_cast<size_t>(i)].intended_send_us = intended_us;
             g_timestamps[static_cast<size_t>(i)].actual_send_us = actual_send_us;
         }
@@ -279,6 +279,8 @@ int main(int argc, char** argv) {
 
     std::vector<int64_t> latencies;
     latencies.reserve(static_cast<size_t>(cfg.message_count));
+    std::vector<std::pair<int, int64_t>> high_latencies;
+    constexpr int64_t kHighLatencyUs = 2000;
     int missing = 0;
     for (int i = 0; i < cfg.message_count; ++i) {
         const Timestamps& ts = g_timestamps[static_cast<size_t>(i)];
@@ -287,7 +289,11 @@ int main(int argc, char** argv) {
             continue;
         }
         // E2E: subscriber observe time - actual publish send time.
-        latencies.push_back(ts.actual_receive_us - ts.actual_send_us);
+        const int64_t latency_us = ts.actual_receive_us - ts.actual_send_us;
+        latencies.push_back(latency_us);
+        if (latency_us > kHighLatencyUs) {
+            high_latencies.emplace_back(i, latency_us);
+        }
     }
 
     std::cout << "sent=" << cfg.message_count
@@ -312,5 +318,11 @@ int main(int argc, char** argv) {
     std::cout << "P99 latency: " << pct(0.99) << " us\n";
     std::cout << "P999 latency: " << pct(0.999) << " us\n";
     std::cout << "Max latency: " << latencies.back() << " us\n";
+
+    std::cout << "latencies > " << kHighLatencyUs << " us: count="
+              << high_latencies.size() << '\n';
+    /*for (const auto& [id, latency_us] : high_latencies) {
+        std::cout << "  (" << id << ": " << latency_us << ")\n";
+    }*/
     return 0;
 }
