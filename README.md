@@ -50,6 +50,7 @@ underneath picks the delivery policy (and, for networking, the transport):
 - [Sequencing guarantees](#sequencing-guarantees)
 - [Trade-offs and rejected alternatives](#trade-offs-and-rejected-alternatives)
 - [Known limitations](#known-limitations)
+- [Performance optimizations (experimental)](#performance-optimizations-experimental)
 - [Project layout](#project-layout)
 - [Build and run](#build-and-run)
 - [Testing](#testing)
@@ -478,6 +479,35 @@ switch; use `-fsanitize=thread` flags directly (below).
 
 
 
+## Performance optimizations (experimental)
+
+These changes are aimed at measuring and reducing publish-path cost under load
+(fewer allocations / copies). They are not a finished “production perf” design.
+Longer notes and numbers live in
+[`docs/performance_journal.md`](docs/performance_journal.md).
+
+- **Clock-driven loadgen publish** — `loadgen` encodes `PUBLISH` and calls
+  `BrokerClient::sendFrame` without waiting on `PUBLISH_ACK`, so send pacing
+  follows `sleep_until(start + i × interval)` instead of serializing on ACKs.
+- **Pre-sized in-place encode** — `encode_*_size()` helpers plus `char*` encode
+  overloads (frame header, publish, deliver) write into a buffer sized once
+  instead of growing a `vector` with repeated `push_back` / `insert`.
+- **Client wire send without an extra copy** — `BrokerClient::sendFrame(id,
+  char*, frame_len)` fills a reserved 4-byte length prefix and sends the
+  preallocated buffer in place.
+- **Server DELIVER path** — `BrokerServer::handlePublish` builds one wire
+  buffer (length + header + deliver body), encodes in place, and moves it into
+  the session queue via `sendWireFrame` / `enqueueFrame(rvalue)` rather than
+  body → frame → wire copies.
+- **Loadgen measurement tweaks** — `Timestamps` are cache-line aligned; the
+  shared mutex around per-id timestamp writes can be dropped for experiments
+  where publisher and subscriber touch different slots / fields. High-latency
+  samples (> 2000 µs) can be counted (and optionally dumped) in the report.
+
+---
+
+
+
 ## Project layout
 
 
@@ -489,9 +519,12 @@ switch; use `-fsanitize=thread` flags directly (below).
 | `publisher.h` / `.cpp`, `subscriber.h` / `.cpp` | App-facing APIs                                          |
 | `protocol_frame.h` / `.cpp`                     | Wire codec                                               |
 | `docs/protocol.md`                              | Protocol specification                                   |
+| `docs/performance_journal.md`                   | Loadgen / broker perf experiments and findings           |
 | `broker_server.h` / `.cpp`                      | Epoll reactor, protocol handlers, subscription indexes   |
 | `session.h` / `.cpp`                            | Per-connection write buffer + subscription-id list       |
 | `broker_client.h` / `.cpp`                      | TCP client + futures / handlers                          |
+| `broker_main.cpp`                               | Standalone broker process                                |
+| `loadgen/main.cpp`                              | E2E load generator (latency percentiles)                 |
 | `main.cpp`                                      | In-process compete / fan-out demo                        |
 | `run_tests.py`                                  | Build / run GoogleTest suites                            |
 | `tests/`                                        | Unit, in-process, protocol, and network suites           |
@@ -599,5 +632,7 @@ see [issue #26](https://github.com/indro8307/pubsub/issues/26).
 - Slow-subscriber isolation under Block (non-serial fan-out enqueue / thread pool).
 - Multi-reactor or worker-pool fan-out if single-threaded publish handling becomes the bottleneck.
 - io_uring (or similar) as a follow-on to epoll.
-- Counters to enhance observability.
+- Extend `loadgen` to measure how many concurrent client connections the broker can sustain.
+- Add metrics counters and export them to Prometheus (with Grafana dashboards for viewing).
+- Package broker and clients as containers and run them on a Kubernetes cluster.
 

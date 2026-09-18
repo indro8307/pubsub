@@ -63,6 +63,9 @@ public:
     // True after SubscribeAck was applied via on_subscribe_ack for this id.
     bool hasSubscription(uint64_t subscription_id) const;
 
+    // True after the owned BrokerClient has finished TCP connect.
+    bool isConnected() const { return broker_client_.isConnected(); }
+
 private:
     void on_subscribe_ack(const SubscribeAck& ack);
 

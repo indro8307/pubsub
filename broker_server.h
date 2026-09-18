@@ -95,6 +95,10 @@ private:
     // Remove finished sessions from |sessions_| (called from acceptLoop or stop).
     void reapFinishedSessions();
 
+    // Enqueue an already-encoded wire frame (length prefix + header + body) and attempt flush.
+    FlushResult sendWireFrame(int client_fd, ProtocolFrameType type, std::vector<uint8_t> wire,
+                              std::shared_ptr<Session> session);
+
     // Encode, enqueue, and attempt flush. Does not close the client — callers
     // must handle FlushResult::FLUSH_CLOSE (avoids reentrant closeClient while
     // iterating subscription maps).

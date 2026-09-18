@@ -93,6 +93,41 @@ std::future<std::shared_ptr<RequestResult>> BrokerClient::sendFrame(
     return future;
 }
 
+std::future<std::shared_ptr<RequestResult>> BrokerClient::sendFrame(
+    uint32_t request_id, char* data, size_t frame_len) {
+    if (!connected_.load(std::memory_order_acquire)) {
+        throw std::runtime_error("BrokerClient not connected");
+    }
+    if (data == nullptr) {
+        throw std::runtime_error("sendFrame data buffer is null");
+    }
+
+    std::promise<std::shared_ptr<RequestResult>> promise;
+    std::future<std::shared_ptr<RequestResult>> future = promise.get_future();
+    {
+        std::lock_guard<std::mutex> lock(request_promises_mutex_);
+        request_promises_[request_id] = std::move(promise);
+    }  // release before send — avoid lock-order deadlock with stop()
+
+    // Fill the reserved 4-byte length prefix (big-endian), then send in place.
+    const uint32_t len = static_cast<uint32_t>(frame_len);
+    data[0] = static_cast<char>(static_cast<uint8_t>(len >> 24));
+    data[1] = static_cast<char>(static_cast<uint8_t>(len >> 16));
+    data[2] = static_cast<char>(static_cast<uint8_t>(len >> 8));
+    data[3] = static_cast<char>(static_cast<uint8_t>(len));
+
+    const size_t wire_size = sizeof(uint32_t) + frame_len;
+    const ssize_t bytes_sent = sendExact(socket_fd_, data, wire_size);
+    if (bytes_sent < 0 || static_cast<size_t>(bytes_sent) != wire_size) {
+        {
+            std::lock_guard<std::mutex> lock(request_promises_mutex_);
+            request_promises_.erase(request_id);
+        }
+        throw std::runtime_error("Failed to send frame");
+    }
+    return future;
+}
+
 uint32_t BrokerClient::generateRequestId() {
     return request_id_counter_.fetch_add(1, std::memory_order_relaxed);
 }

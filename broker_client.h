@@ -36,6 +36,12 @@ public:
 
     std::future<std::shared_ptr<RequestResult>> sendFrame(uint32_t request_id,
                                                           std::vector<uint8_t> data);
+    // |data| is a preallocated wire buffer: first 4 bytes are reserved for the
+    // big-endian frame length; |frame_len| is the size of the frame body that
+    // already occupies data[4 .. 4+frame_len).
+    std::future<std::shared_ptr<RequestResult>> sendFrame(uint32_t request_id,
+                                                          char* data,
+                                                          size_t frame_len);
 
     uint32_t generateRequestId();
     bool isConnected() const;
